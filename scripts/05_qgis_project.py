@@ -50,6 +50,15 @@ SHAPEBURST_M = 400
 EXCLUDED = "#ff1744"
 RANGE = "#7c4dff"
 CASING = "#ffffff"
+# a white hairline vanishes into salt flat and pale playa, so the BLM boundary gets a
+# dark casing under it - the pair reads on bright ground and on canopy alike
+CASING_UNDER = "#101010"
+# Amber wash over every acre of BLM surface, following the convention BLM's own land-status
+# maps use for its holdings. It is the one hue family the ramps left unclaimed - magenta,
+# cyan, red and violet are all spoken for - and it is the bottom vector layer, so the alpha
+# is set low enough that the two ramps still read cleanly through it.
+BLM_WASH = "#ffb300"
+BLM_WASH_ALPHA = 56  # 0-255
 # QGIS provider strings percent-encode the inner URL: '=' -> %3D, '&' -> %26.
 GOOGLE_SAT = (
     "type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D"
@@ -98,6 +107,28 @@ def shapeburst(color, outline=None, width=0.5, distance_m=SHAPEBURST_M):
     return sym
 
 
+def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None):
+    """Flat translucent fill, then a dark casing line, then a lighter line over that.
+
+    Used for the statewide BLM surface, which has to stay legible against imagery that
+    swings from black canopy to white salt without ever competing with the ramps. The
+    alpha rides on the fill colour rather than the symbol, so the boundary stays opaque.
+    """
+    c = QColor(fill_color)
+    c.setAlpha(alpha)
+    sym = QgsFillSymbol.createSimple({
+        "color": f"{c.red()},{c.green()},{c.blue()},{c.alpha()}",
+        "outline_style": "no",
+    })
+    beneath = QgsSimpleLineSymbolLayer(QColor(under))
+    beneath.setWidth(under_width if under_width is not None else width * 2.5)
+    sym.appendSymbolLayer(beneath)
+    over = QgsSimpleLineSymbolLayer(QColor(line))
+    over.setWidth(width)
+    sym.appendSymbolLayer(over)
+    return sym
+
+
 def graduated(field, ramp, symbol=fill):
     ranges = [
         QgsRendererRange(lo, hi, symbol(color), label)
@@ -131,10 +162,8 @@ def main():
     project.addMapLayer(basemap)
 
     blm = add(project, gpkg_layer("blm_all"), "All BLM surface")
-    # outline only - QColor does not read 8-digit #rrggbbaa here, so kill the fill
-    # with the brush style rather than an alpha channel
     blm.setRenderer(QgsSingleSymbolRenderer(
-        fill("#00000000", outline=CASING, width=0.16, opacity=0.6, style="no")))
+        washed(BLM_WASH, BLM_WASH_ALPHA, CASING, width=0.3)))
 
     rng = add(project, gpkg_layer("juniper_range"), "Little 1971 J. osteosperma range")
     rng.setRenderer(QgsSingleSymbolRenderer(

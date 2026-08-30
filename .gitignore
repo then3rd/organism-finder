@@ -1,0 +1,5 @@
+.tokensave/
+data/
+out/
+.venv/
+__pycache__/

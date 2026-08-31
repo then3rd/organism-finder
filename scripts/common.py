@@ -1,24 +1,21 @@
-"""Shared helpers: ArcGIS REST paging + project paths."""
+"""Shared helpers: ArcGIS REST paging + HTTP retry.
+
+Paths live in paths.py and the working projection on the Region record, because stage 05
+needs both under the system interpreter and cannot import requests.
+"""
 from pathlib import Path
 import json
 import time
 
 import requests
 
-ROOT = Path(__file__).resolve().parent.parent
-RAW = ROOT / "data" / "raw"
-WORK = ROOT / "data" / "work"
-OUT = ROOT / "out"
-for _d in (RAW, WORK, OUT):
-    _d.mkdir(parents=True, exist_ok=True)
+from paths import OUT, RAW, ROOT, WORK  # noqa: F401 - re-exported for the stages
 
-# BLM Utah publishes everything in NAD83 / UTM 12N; stay in it so areas are metric.
-CRS = "EPSG:26912"
-# LANDFIRE CONUS grid.
+# LANDFIRE CONUS grid. Region-independent, unlike the working CRS.
 CRS_LF = "EPSG:5070"
 
 SESSION = requests.Session()
-SESSION.headers["User-Agent"] = "juniper-blm-overlay/1.0"
+SESSION.headers["User-Agent"] = "blm-tree-overlay/2.0"
 
 
 def get(url, params=None, timeout=180, retries=4, stream=False):
@@ -27,8 +24,14 @@ def get(url, params=None, timeout=180, retries=4, stream=False):
     for attempt in range(retries):
         try:
             r = SESSION.get(url, params=params, timeout=timeout, stream=stream)
+            # 4xx is the server telling us the request is wrong, not that it is busy;
+            # backing off four times only delays the real error message.
+            if 400 <= r.status_code < 500:
+                raise RuntimeError(f"HTTP {r.status_code} for {url}")
             r.raise_for_status()
             return r
+        except RuntimeError:
+            raise
         except Exception as exc:  # noqa: BLE001 - retry anything transient
             last = exc
             time.sleep(3 * (attempt + 1))

@@ -1,4 +1,8 @@
-# Utah juniper x BLM land - transplant permit screening
+# Tree species x BLM land - transplant permit screening
+#
+# Every recipe takes a species slug from scripts/species.py; `just species` lists them.
+#   just all              # Utah juniper, the default
+#   just all pinuedul     # two-needle pinyon
 
 py := ".venv/bin/python"
 # PyQGIS lives in system python, not the venv.
@@ -13,40 +17,49 @@ setup:
     uv pip install --python {{py}} \
       geopandas rasterio exactextract simplekml gpxpy requests pyogrio
 
+# List the species this pipeline knows how to screen for.
+species:
+    @{{py}} scripts/species.py
+
+# Which LANDFIRE EVT classes a keyword selects - use before adding a species.
+evt-classes *keywords:
+    @{{py}} scripts/evt_classes.py {{keywords}}
+
 # Sources -> data/raw (cached).
-fetch:
-    {{py}} scripts/01_fetch.py
+fetch sp="junioste":
+    {{py}} scripts/01_fetch.py {{sp}}
 
-# EVT tiles -> data/work/juniper_class.vrt.
-landfire:
-    {{py}} scripts/02_landfire.py
+# EVT tiles -> data/work/<sp>/class.vrt.
+landfire sp="junioste":
+    {{py}} scripts/02_landfire.py {{sp}}
 
-# The cross-reference -> out/juniper_blm.gpkg.
-overlay:
-    {{py}} scripts/03_overlay.py
+# The cross-reference -> out/<sp>/<sp>_blm.gpkg.
+overlay sp="junioste":
+    {{py}} scripts/03_overlay.py {{sp}}
 
-# csv / md / kml / gpx -> out/.
-export:
-    {{py}} scripts/04_export.py
+# csv / md / kml / gpx -> out/<sp>/.
+export sp="junioste":
+    {{py}} scripts/04_export.py {{sp}}
 
-# The QGIS project -> juniper_blm.qgs.
-qgis:
-    {{qgis_py}} scripts/05_qgis_project.py
+# The QGIS project -> <sp>_blm.qgs.
+qgis sp="junioste":
+    {{qgis_py}} scripts/05_qgis_project.py {{sp}}
 
 # Full pipeline, in order.
-all: fetch landfire overlay export qgis
+all sp="junioste": (fetch sp) (landfire sp) (overlay sp) (export sp) (qgis sp)
 
 # Open the map in QGIS.
-open: qgis
-    qgis juniper_blm.qgs
+open sp="junioste": (qgis sp)
+    qgis {{sp}}_blm.qgs
 
 # Print the acreage funnel and summary.
-summary:
-    @cat out/summary.md
+summary sp="junioste":
+    @cat out/{{sp}}/summary.md
 
 # Delete generated outputs; keeps the data/ download cache.
 clean:
-    rm -rf out juniper_blm.qgs juniper_blm.qgs~ juniper_blm_attachments.zip
+    rm -rf out
+    rm -f *_blm.qgs *_blm.qgs~ *_blm_attachments.zip
     find scripts -name __pycache__ -type d -exec rm -rf {} +
 
 # Delete outputs *and* the download cache - next run re-downloads everything.

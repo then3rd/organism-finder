@@ -1,14 +1,17 @@
-"""Turn out/juniper_blm.gpkg into the tabular and field deliverables.
+"""Turn out/<slug>/<slug>_blm.gpkg into the tabular and field deliverables.
 
-The map itself is juniper_blm.qgs - see scripts/05_qgis_project.py.
+The map itself is <slug>_blm.qgs - see scripts/05_qgis_project.py.
 
-  out/candidates.csv     one row per eligible BLM polygon
-  out/hotspots.csv       one row per scouting cell
-  out/summary.md         permit-oriented summary + per-field-office rollup
-  out/scouting.kml/.gpx  spatially spread waypoints for a phone GPS
+  out/<slug>/candidates.csv     one row per eligible BLM polygon
+  out/<slug>/hotspots.csv       one row per scouting cell
+  out/<slug>/summary.md         permit-oriented summary + per-field-office rollup
+  out/<slug>/scouting.kml/.gpx  spatially spread waypoints for a phone GPS
+
+    .venv/bin/python scripts/04_export.py [species-slug]
 """
 from pathlib import Path
 import sys
+import textwrap
 
 import geopandas as gpd
 import gpxpy.gpx
@@ -17,24 +20,29 @@ import pandas as pd
 import simplekml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import OUT  # noqa: E402
-
-GPKG = OUT / "juniper_blm.gpkg"
+import paths  # noqa: E402
+import region as region_mod  # noqa: E402
+import species as species_mod  # noqa: E402
 
 N_WAYPOINTS = 50
+N_TABLE = 25                # how many of those waypoints summary.md lists
 MIN_SEPARATION_M = 8000     # keep waypoints spread out instead of 50 adjacent cells
+
+
+def title(sp):
+    return sp.common_name[:1].upper() + sp.common_name[1:]
 
 
 def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
     """Pick strong cells that are spread out and cover every field office.
 
-    Thousands of cells tie at 100 % juniper, so a plain greedy pass returns 50 neighbours in
+    Thousands of cells tie at 100 % cover, so a plain greedy pass returns 50 neighbours in
     one canyon. Instead: round-robin over field offices, each time taking that office's best
     remaining cell that is at least `sep` from everything already picked.
     """
     pts = hot.representative_point()
     xy = np.column_stack([pts.x.to_numpy(), pts.y.to_numpy()])
-    order = np.argsort(-hot["juniper_acres"].to_numpy(), kind="stable")
+    order = np.argsort(-hot["species_acres"].to_numpy(), kind="stable")
     by_office = {}
     for i in order:
         by_office.setdefault(hot["field_office"].iat[i], []).append(i)
@@ -59,26 +67,26 @@ def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
     return hot.iloc[chosen].reset_index(drop=True)
 
 
-def tables(cand, hot, funnel):
+def tables(cand, hot, funnel, sp, reg, out):
     cols = ["rank", "field_office", "county", "DESIG", "in_lwc", "blm_acres",
-            "juniper_acres", "juniper_pct", "dominant_evt", "office_url"]
+            "species_acres", "species_pct", "dominant_evt", "office_url"]
     c = cand[cols].copy()
     pts = cand.representative_point().to_crs(4326)
     c["lat"], c["lon"] = pts.y.round(5).to_numpy(), pts.x.round(5).to_numpy()
-    for col in ("blm_acres", "juniper_acres", "juniper_pct"):
+    for col in ("blm_acres", "species_acres", "species_pct"):
         c[col] = c[col].round(1)
-    c.to_csv(OUT / "candidates.csv", index=False)
+    c.to_csv(out / "candidates.csv", index=False)
 
     h = hot.drop(columns="geometry").copy()
-    for col in ("blm_acres", "juniper_acres", "juniper_pct"):
+    for col in ("blm_acres", "species_acres", "species_pct"):
         h[col] = h[col].round(1)
-    h.to_csv(OUT / "hotspots.csv", index=False)
+    h.to_csv(out / "hotspots.csv", index=False)
 
     rollup = (
         cand.groupby("field_office")
         .agg(parcels=("rank", "size"), blm_acres=("blm_acres", "sum"),
-             juniper_acres=("juniper_acres", "sum"))
-        .sort_values("juniper_acres", ascending=False)
+             species_acres=("species_acres", "sum"))
+        .sort_values("species_acres", ascending=False)
         .round(0)
         .astype(int)
     )
@@ -86,11 +94,11 @@ def tables(cand, hot, funnel):
     rollup = rollup.join(hot_roll).fillna(0).astype(int)
 
     lines = [
-        "# Utah juniper on BLM land - transplant permit screening",
+        f"# {title(sp)} on BLM land - transplant permit screening",
         "",
-        "Cross-reference of three layers: **BLM Utah Surface Management Agency** (who issues the",
-        "permit) x **Little 1971 *Juniperus osteosperma* range** (species filter) x **LANDFIRE",
-        "EVT 30 m** (where juniper actually grows).",
+        f"Cross-reference of three layers: **BLM {reg.name} Surface Management Agency** (who",
+        f"issues the permit) x **Little 1971 *{sp.binomial}* range** (species filter) x",
+        f"**LANDFIRE EVT 30 m** (where {sp.short} actually grows).",
         "",
         "## How the acreage narrows",
         "",
@@ -104,33 +112,33 @@ def tables(cand, hot, funnel):
         "## Where to apply",
         "",
         "Live-plant / vegetative-product permits are issued by the **field office** that",
-        "administers the ground, not by the state office. Acres below are juniper acres on",
+        f"administers the ground, not by the state office. Acres below are {sp.short} acres on",
         "eligible (non-Wilderness, non-WSA, non-monument) BLM surface.",
         "",
-        "| field office | parcels | BLM acres | juniper acres | 1 km² hex cells |",
+        f"| field office | parcels | BLM acres | {sp.short} acres | 1 km² hex cells |",
         "|---|---:|---:|---:|---:|",
     ]
     for name, r in rollup.iterrows():
         lines.append(
             f"| {name} | {r['parcels']:,} | {r['blm_acres']:,} | "
-            f"{r['juniper_acres']:,} | {r['scouting_cells']:,} |"
+            f"{r['species_acres']:,} | {r['scouting_cells']:,} |"
         )
     lines += [
         "",
-        "## 25 places to scout",
+        f"## {N_TABLE} places to scout",
         "",
         "The same greedy pick as `scouting.gpx`: best hex cell first, then everything within",
-        f"{MIN_SEPARATION_M // 1000} km of it dropped, repeat — so these are spread across the",
-        "state rather than 25 adjacent cells in one canyon. Coordinates are WGS84 and land",
-        "inside the cell.",
+        f"{MIN_SEPARATION_M // 1000} km of it dropped, repeat — so these are spread across",
+        f"{reg.name} rather than {N_TABLE} adjacent cells in one canyon. Coordinates are WGS84",
+        "and land inside the cell.",
         "",
-        "| rank | field office | county | juniper % | juniper acres | dominant type | lat | lon |",
+        f"| rank | field office | county | {sp.short} % | {sp.short} acres | dominant type | lat | lon |",
         "|---:|---|---|---:|---:|---|---:|---:|",
     ]
-    for _, r in spread(hot).head(25).iterrows():
+    for _, r in spread(hot).head(N_TABLE).iterrows():
         lines.append(
-            f"| {r['rank']} | {r['field_office']} | {r['county']} | {r['juniper_pct']:.0f} | "
-            f"{r['juniper_acres']:.0f} | {r['dominant_evt']} | {r['lat']:.5f} | {r['lon']:.5f} |"
+            f"| {r['rank']} | {r['field_office']} | {r['county']} | {r['species_pct']:.0f} | "
+            f"{r['species_acres']:.0f} | {r['dominant_evt']} | {r['lat']:.5f} | {r['lon']:.5f} |"
         )
     lines += [
         "",
@@ -140,24 +148,34 @@ def tables(cand, hot, funnel):
         "  or mineral leases, rights-of-way, sage-grouse habitat closures, developed recreation",
         "  sites, riparian buffers, or cultural-resource restrictions.",
         "* Little's range map is 1:2,000,000 (1971) and LANDFIRE EVT is 30 m *modelled* cover.",
-        "  Both are screening tools. Ground-truth the species before collecting - Great Basin and",
-        "  Colorado Plateau pinyon-juniper types contain pinyon pine and, at the margins,",
-        "  *J. scopulorum* and *J. monosperma*.",
+        # the caveat is per-species prose of unknown length, so wrap it to match the
+        # hand-wrapped bullets around it
+        textwrap.fill(
+            "  Both are screening tools. Ground-truth the species before collecting - "
+            + sp.ground_truth_caveat,
+            width=90, initial_indent="", subsequent_indent="  ",
+            # "pinyon-juniper" split across lines renders as "pinyon- juniper"
+            break_on_hyphens=False, break_long_words=False,
+        ),
         "* Lands with wilderness characteristics (`in_lwc`) are not closed, but expect scrutiny.",
+        "* The `off_blm_cells` layer in the GeoPackage grids the same range x EVT screen over",
+        "  ground BLM does *not* administer - private, state, tribal, other agencies. It shows",
+        "  where the stands are, and there is no BLM permit to be had on any of it. Nothing in",
+        "  this document is derived from it.",
         "",
     ]
-    (OUT / "summary.md").write_text("\n".join(lines))
+    (out / "summary.md").write_text("\n".join(lines))
     print("  -> candidates.csv, hotspots.csv, summary.md")
     return rollup
 
 
-def waypoints(hot):
+def waypoints(hot, sp, out):
     picks = spread(hot)
-    kml = simplekml.Kml(name="Utah juniper scouting - BLM land")
+    kml = simplekml.Kml(name=f"{title(sp)} scouting - BLM land")
     gpx = gpxpy.gpx.GPX()
     for _, r in picks.iterrows():
-        label = f"{int(r['rank']):04d} {r['field_office']} {r['juniper_pct']:.0f}%"
-        desc = (f"{r['dominant_evt']}\n{r['juniper_acres']:.0f} juniper acres in cell\n"
+        label = f"{int(r['rank']):04d} {r['field_office']} {r['species_pct']:.0f}%"
+        desc = (f"{r['dominant_evt']}\n{r['species_acres']:.0f} {sp.short} acres in cell\n"
                 f"{r['county']} County - {r['field_office']}")
         kml.newpoint(name=label, description=desc, coords=[(r["lon"], r["lat"])])
         gpx.waypoints.append(
@@ -174,19 +192,24 @@ def waypoints(hot):
             )
             p.style.polystyle.color = "7fffe500"   # cyan, KML is aabbggrr
             p.style.linestyle.color = "ffffe500"
-    kml.save(str(OUT / "scouting.kml"))
-    (OUT / "scouting.gpx").write_text(gpx.to_xml())
+    kml.save(str(out / "scouting.kml"))
+    (out / "scouting.gpx").write_text(gpx.to_xml())
     print(f"  -> scouting.kml, scouting.gpx ({len(picks)} waypoints, "
           f">={MIN_SEPARATION_M/1000:g} km apart)")
 
 
 def main():
-    cand = gpd.read_file(GPKG, layer="candidates")
-    hot = gpd.read_file(GPKG, layer="hotspots")
-    funnel = pd.read_csv(OUT / "funnel.csv")
-    print(f"candidates={len(cand)}  hotspots={len(hot)}")
-    tables(cand, hot, funnel)
-    waypoints(hot)
+    sp = species_mod.resolve(sys.argv)
+    reg = region_mod.resolve()
+    out = paths.out_dir(sp)
+    gpkg = paths.gpkg_path(sp)
+
+    cand = gpd.read_file(gpkg, layer="candidates")
+    hot = gpd.read_file(gpkg, layer="hotspots")
+    funnel = pd.read_csv(out / "funnel.csv")
+    print(f"{sp.common_name}: candidates={len(cand)}  hotspots={len(hot)}")
+    tables(cand, hot, funnel, sp, reg, out)
+    waypoints(hot, sp, out)
 
 
 if __name__ == "__main__":

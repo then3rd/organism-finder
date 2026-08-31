@@ -3,3 +3,5 @@ data/
 out/
 .venv/
 __pycache__/
+*.qgs*
+*_attachments.zip

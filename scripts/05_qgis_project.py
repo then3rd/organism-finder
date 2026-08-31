@@ -1,10 +1,13 @@
-"""Build juniper_blm.qgs from out/juniper_blm.gpkg.
+"""Build <slug>_blm.qgs from out/<slug>/<slug>_blm.gpkg.
 
 Run with the system interpreter (PyQGIS is not in the project venv):
-    /usr/bin/python3 scripts/05_qgis_project.py
+    /usr/bin/python3 scripts/05_qgis_project.py [species-slug]
+
+paths/species/region are standard-library only precisely so this stage can import them.
 """
 from pathlib import Path
 import os
+import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,13 +16,15 @@ from qgis.core import (  # noqa: E402
     QgsGraduatedSymbolRenderer, QgsRendererRange, QgsSingleSymbolRenderer,
     QgsFillSymbol, QgsMarkerSymbol, QgsPalLayerSettings, QgsTextFormat,
     QgsVectorLayerSimpleLabeling, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransformContext, QgsDatumTransform,
     QgsShapeburstFillSymbolLayer, QgsSimpleLineSymbolLayer, QgsUnitTypes,
 )
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent.parent
-GPKG = ROOT / "out" / "juniper_blm.gpkg"
-QGS = ROOT / "juniper_blm.qgs"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import paths  # noqa: E402
+import region as region_mod  # noqa: E402
+import species as species_mod  # noqa: E402
 
 # Single-hue magenta ramp: nothing in desert aerial imagery is this colour, so the
 # fills stay separable from both canopy and bare ground. Cyan is the one accent.
@@ -27,17 +32,17 @@ QGS = ROOT / "juniper_blm.qgs"
 # The ramp belongs to the 1 km² hex cells; every one of them clears HOTSPOT_MIN_PCT (25 %)
 # by construction, so the breaks start there instead of at zero.
 RAMP_CELLS = [
-    (25, 40, "#ffb3e0", "cell 25-40 % juniper"),
+    (25, 40, "#ffb3e0", "cell 25-40 % {short}"),
     (40, 55, "#ff3fb0", "cell 40-55 %"),
     (55, 70, "#a80078", "cell 55-70 %"),
     (70, 85, "#6b0050", "cell 70-85 %"),
     (85, 101, "#4d0038", "cell 85 %+"),
 ]
 # The parcel gradient uses the same idea one hue over: light cyan for a parcel that is
-# mostly not juniper, deep teal-blue for one that mostly is. Steps are spread wide
+# mostly bare of it, deep teal-blue for one that is mostly the tree. Steps are spread wide
 # because cyan has a narrow gamut - these clear the ~15 dE adjacent-pair floor.
 RAMP_PARCELS = [
-    (0, 10, "#d6faff", "parcel 0-10 % juniper"),
+    (0, 10, "#d6faff", "parcel 0-10 % {short}"),
     (10, 25, "#5cd6f2", "parcel 10-25 %"),
     (25, 40, "#00a3c9", "parcel 25-40 %"),
     (40, 60, "#00647f", "parcel 40-60 %"),
@@ -47,6 +52,21 @@ RAMP_PARCELS = [
 # it follows the contour at working zoom and thins to the outline at statewide zoom,
 # where a fixed screen width would instead flood every small parcel solid cyan
 SHAPEBURST_M = 400
+# The off-BLM context grid. Every hue is spoken for by the time this ramp is placed -
+# magenta and cyan by the two BLM ramps, red by exclusions, violet by Little's range,
+# amber by the BLM wash - and the two that are left, green and brown, are the ground
+# itself. So this ramp is achromatic: lightness is the one channel no ramp above uses as
+# its identity and the one channel every form of colour blindness preserves intact, which
+# is also why the neutral steps hold their spacing under simulated CVD to the decimal.
+# Four classes rather than five because five neutral steps cannot span 0-100 % lightness
+# and still clear the 20 dE adjacent-pair floor; these clear it at ~24.6. Reading grey as
+# "no jurisdiction" is the point - these cells are context, not permit targets.
+RAMP_OFFBLM = [
+    (25, 45, "#fafafa", "off-BLM cell 25-45 % {short}"),
+    (45, 65, "#979797", "off-BLM cell 45-65 %"),
+    (65, 85, "#595959", "off-BLM cell 65-85 %"),
+    (85, 101, "#0a0a0a", "off-BLM cell 85 %+"),
+]
 EXCLUDED = "#ff1744"
 RANGE = "#7c4dff"
 CASING = "#ffffff"
@@ -60,10 +80,41 @@ CASING_UNDER = "#101010"
 BLM_WASH = "#ffb300"
 BLM_WASH_ALPHA = 56  # 0-255
 # QGIS provider strings percent-encode the inner URL: '=' -> %3D, '&' -> %26.
+BASEMAP_CRS = "EPSG:3857"
 GOOGLE_SAT = (
     "type=xyz&url=https://mt1.google.com/vt/lyrs%3Ds%26x%3D%7Bx%7D%26y%3D%7By%7D"
     "%26z%3D%7Bz%7D&zmax=20&zmin=0"
 )
+
+
+def best_operation(src_crs, dst_crs):
+    """The most accurate NAD83 -> WGS 84 pipeline this machine can actually run.
+
+    What QGIS stores per CRS pair is the *whole* transformation, not just the datum shift,
+    so this has to be a full proj pipeline - a bare `+proj=noop` would skip the UTM-to-
+    Mercator projection step too and drop Utah into the Mediterranean. Asking QGIS for the
+    pipeline rather than writing one out also means the answer improves by itself the day
+    somebody installs the NADCON5 grids: the highest-accuracy operation here today is the
+    4 m gridless one, and the 2 m `us_noaa_uthpgn` variant would win as soon as it exists.
+    Either is far inside a 30 m LANDFIRE pixel.
+    """
+    src = QgsCoordinateReferenceSystem(src_crs)
+    dst = QgsCoordinateReferenceSystem(dst_crs)
+    # enumerating the operations makes PROJ complain on stderr about every grid that is not
+    # installed, which is the normal case and not something the run should report
+    with open(os.devnull, "w") as null:
+        saved = os.dup(2)
+        os.dup2(null.fileno(), 2)
+        try:
+            ops = [o for o in QgsDatumTransform.operations(src, dst) if o.isAvailable]
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+    if not ops:
+        raise RuntimeError(f"no available {src_crs} -> {dst_crs} operation")
+    best = min(ops, key=lambda o: o.accuracy if o.accuracy > 0 else float("inf"))
+    print(f"  datum transform: {best.name} ({best.accuracy} m)")
+    return best.proj
 
 
 def fill(color, outline=CASING, width=0.4, style="solid", opacity=1.0):
@@ -129,9 +180,9 @@ def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None)
     return sym
 
 
-def graduated(field, ramp, symbol=fill):
+def graduated(field, ramp, sp, symbol=fill):
     ranges = [
-        QgsRendererRange(lo, hi, symbol(color), label)
+        QgsRendererRange(lo, hi, symbol(color), label.format(short=sp.short))
         for lo, hi, color, label in ramp
     ]
     return QgsGraduatedSymbolRenderer(field, ranges)
@@ -145,44 +196,72 @@ def add(project, layer, name):
     return layer
 
 
-def gpkg_layer(name):
-    return QgsVectorLayer(f"{GPKG}|layername={name}", name, "ogr")
+def gpkg_layer(gpkg, name):
+    return QgsVectorLayer(f"{gpkg}|layername={name}", name, "ogr")
 
 
 def main():
+    sp = species_mod.resolve(sys.argv)
+    reg = region_mod.resolve()
+    gpkg = paths.gpkg_path(sp)
+    qgs_path = paths.qgs_path(sp)
+    if not gpkg.exists():
+        raise SystemExit(f"{gpkg} not found - run stages 03 and 04 for {sp.slug} first")
+    tree = sp.common_name[:1].upper() + sp.common_name[1:]
+
     qgs = QgsApplication([], False)
     qgs.initQgis()
     project = QgsProject.instance()
-    project.setCrs(QgsCoordinateReferenceSystem("EPSG:26912"))
-    project.setTitle("Utah juniper on BLM land - transplant permit screening")
+    project.setCrs(QgsCoordinateReferenceSystem(reg.crs))
+    # The layers are NAD83 and the XYZ basemap is WGS 84 pseudo-Mercator, and NAD83 ->
+    # WGS 84 has a dozen published operations, so QGIS interrupts every open to ask which
+    # one unless the project names one itself.
+    ctx = QgsCoordinateTransformContext()
+    ctx.addCoordinateOperation(
+        QgsCoordinateReferenceSystem(reg.crs),
+        QgsCoordinateReferenceSystem(BASEMAP_CRS),
+        best_operation(reg.crs, BASEMAP_CRS),
+    )
+    project.setTransformContext(ctx)
+    project.setTitle(f"{tree} on BLM land - transplant permit screening")
 
     basemap = QgsRasterLayer(GOOGLE_SAT, "Google Satellite", "wms")
     if not basemap.isValid():
         raise RuntimeError("Google satellite basemap failed to load")
     project.addMapLayer(basemap)
 
-    blm = add(project, gpkg_layer("blm_all"), "All BLM surface")
+    blm = add(project, gpkg_layer(gpkg, "blm_all"), "All BLM surface")
     blm.setRenderer(QgsSingleSymbolRenderer(
         washed(BLM_WASH, BLM_WASH_ALPHA, CASING, width=0.3)))
 
-    rng = add(project, gpkg_layer("juniper_range"), "Little 1971 J. osteosperma range")
+    rng = add(project, gpkg_layer(gpkg, "species_range"),
+              f"Little 1971 {sp.binomial} range")
     rng.setRenderer(QgsSingleSymbolRenderer(
         fill("#00000000", outline=RANGE, width=0.6, style="no")))
 
-    excl = add(project, gpkg_layer("exclusions"), "Excluded: Wilderness / WSA / NM-NCA")
+    excl = add(project, gpkg_layer(gpkg, "exclusions"),
+               "Excluded: Wilderness / WSA / NM-NCA")
     excl.setRenderer(QgsSingleSymbolRenderer(
         fill(EXCLUDED, outline=EXCLUDED, width=0.3, style="b_diagonal", opacity=0.6)))
 
-    hot = add(project, gpkg_layer("hotspots"), "Scouting cells (1 km² hex, juniper %)")
-    hot.setRenderer(graduated("juniper_pct", RAMP_CELLS, cell_fill))
+    off = gpkg_layer(gpkg, "off_blm_cells")
+    if off.isValid() and off.featureCount():
+        add(project, off, f"Off-BLM cells (1 km² hex, {sp.short} %) - no permit")
+        off.setRenderer(graduated("species_pct", RAMP_OFFBLM, sp, cell_fill))
+        off.setOpacity(0.55)
+
+    hot = add(project, gpkg_layer(gpkg, "hotspots"),
+              f"Scouting cells (1 km² hex, {sp.short} %)")
+    hot.setRenderer(graduated("species_pct", RAMP_CELLS, sp, cell_fill))
     hot.setOpacity(0.65)
 
     # added after the cells so it draws on top: the gradient is transparent in the
     # middle, so it rims the parcel without hiding the cells inside it
-    cand = add(project, gpkg_layer("candidates"), "Eligible BLM parcels (juniper %)")
-    cand.setRenderer(graduated("juniper_pct", RAMP_PARCELS, shapeburst))
+    cand = add(project, gpkg_layer(gpkg, "candidates"),
+               f"Eligible BLM parcels ({sp.short} %)")
+    cand.setRenderer(graduated("species_pct", RAMP_PARCELS, sp, shapeburst))
 
-    offices = add(project, gpkg_layer("office_points"), "BLM offices")
+    offices = add(project, gpkg_layer(gpkg, "office_points"), "BLM offices")
     offices.setRenderer(QgsSingleSymbolRenderer(QgsMarkerSymbol.createSimple(
         {"name": "circle", "color": "#ffffff", "outline_color": "#000000",
          "outline_width": "0.4", "size": "3"}
@@ -201,8 +280,8 @@ def main():
     offices.setLabeling(QgsVectorLayerSimpleLabeling(label))
     offices.setLabelsEnabled(True)
 
-    project.write(str(QGS))
-    print(f"-> {QGS.name} with {len(project.mapLayers())} layers")
+    project.write(str(qgs_path))
+    print(f"-> {qgs_path.name} with {len(project.mapLayers())} layers")
     qgs.exitQgis()
 
 

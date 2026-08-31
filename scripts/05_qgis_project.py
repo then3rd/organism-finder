@@ -206,6 +206,12 @@ def main():
     gpkg = paths.gpkg_path(sp)
     qgs_path = paths.qgs_path(sp)
     if not gpkg.exists():
+        # Stage 03 writes funnel.csv either way, so its presence separates "screened, and
+        # no BLM ground qualified" - which has no map to draw - from "never run".
+        if (paths.out_dir(sp) / "funnel.csv").exists():
+            print(f"{sp.common_name}: nothing qualified, no map to draw "
+                  f"(see out/{sp.slug}/summary.md)")
+            return
         raise SystemExit(f"{gpkg} not found - run stages 03 and 04 for {sp.slug} first")
     tree = sp.common_name[:1].upper() + sp.common_name[1:]
 

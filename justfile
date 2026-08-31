@@ -48,6 +48,17 @@ qgis sp="junioste":
 # Full pipeline, in order.
 all sp="junioste": (fetch sp) (landfire sp) (overlay sp) (export sp) (qgis sp)
 
+# Every registered species, in registry order. Hours, not minutes.
+all-species:
+    #!/usr/bin/env bash
+    # Stage 03 is the long pole and runs once per tree. The EVT download is cached
+    # region-wide, so only the first species ever pays for it.
+    set -euo pipefail
+    for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.SPECIES))'); do
+      echo "=========== $sp ==========="
+      just all "$sp"
+    done
+
 # Open the map in QGIS.
 open sp="junioste": (qgis sp)
     qgis {{sp}}_blm.qgs

@@ -46,8 +46,19 @@ just evt-classes ponderosa jeffrey
 Both a 404 on the slug and an empty EVT match are hard errors; the pipeline will not hand you a
 plausible-looking empty map.
 
-Registered: `junioste` Utah juniper · `pinuedul` two-needle pinyon · `pinupond` ponderosa pine ·
-`quergamb` Gambel oak · `poputrem` quaking aspen.
+Registered, 15 trees covering every tree-bearing EVT class present in Utah:
+`junioste` Utah juniper · `juniscop` Rocky Mountain juniper · `pinuedul` two-needle pinyon ·
+`pinumono` singleleaf pinyon · `pinupond` ponderosa pine · `pseumenz` Douglas-fir ·
+`pinucont` lodgepole pine · `pinuflex` limber pine · `pinulong` Great Basin bristlecone pine ·
+`piceenge` Engelmann spruce · `abielasi` subalpine fir · `poputrem` quaking aspen ·
+`acergran` bigtooth maple · `quergamb` Gambel oak · `cercledi` curl-leaf mountain mahogany.
+
+Some Utah trees are absent on purpose: no EVT class present in the state names cottonwood or
+white fir, so there is nothing to screen against. A tree with no EVT signal gets no entry.
+
+A species whose Little range reaches Utah but whose stands are all off BLM surface — the
+high-elevation conifers, mostly National Forest — is not an error. Stage 03 writes the funnel,
+says nothing qualified, and exits 0; you get a `summary.md` explaining it and no map.
 
 ## Outputs (`out/<slug>/`)
 

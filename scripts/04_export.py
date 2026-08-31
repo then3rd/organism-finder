@@ -25,6 +25,7 @@ import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
 
 N_WAYPOINTS = 50
+HOTSPOT_MIN_PCT = 25.0      # mirrors 03_overlay.py, for the no-cells wording only
 N_TABLE = 25                # how many of those waypoints summary.md lists
 MIN_SEPARATION_M = 8000     # keep waypoints spread out instead of 50 adjacent cells
 
@@ -123,23 +124,37 @@ def tables(cand, hot, funnel, sp, reg, out):
             f"| {name} | {r['parcels']:,} | {r['blm_acres']:,} | "
             f"{r['species_acres']:,} | {r['scouting_cells']:,} |"
         )
-    lines += [
-        "",
-        f"## {N_TABLE} places to scout",
-        "",
-        "The same greedy pick as `scouting.gpx`: best hex cell first, then everything within",
-        f"{MIN_SEPARATION_M // 1000} km of it dropped, repeat — so these are spread across",
-        f"{reg.name} rather than {N_TABLE} adjacent cells in one canyon. Coordinates are WGS84",
-        "and land inside the cell.",
-        "",
-        f"| rank | field office | county | {sp.short} % | {sp.short} acres | dominant type | lat | lon |",
-        "|---:|---|---|---:|---:|---|---:|---:|",
-    ]
-    for _, r in spread(hot).head(N_TABLE).iterrows():
-        lines.append(
-            f"| {r['rank']} | {r['field_office']} | {r['county']} | {r['species_pct']:.0f} | "
-            f"{r['species_acres']:.0f} | {r['dominant_evt']} | {r['lat']:.5f} | {r['lon']:.5f} |"
-        )
+    # A thin species can yield fewer cells than N_TABLE, or none at all - title the
+    # section by what is actually in it rather than promising 25 rows above an empty table.
+    picks = spread(hot).head(N_TABLE)
+    if not len(picks):
+        lines += [
+            "",
+            "## Nowhere to scout",
+            "",
+            f"No 1 km² cell on eligible BLM surface reaches {HOTSPOT_MIN_PCT:g} % {sp.short}",
+            "cover, so there is no waypoint list and `scouting.kml` / `scouting.gpx` were not",
+            f"written. The parcels above do carry mapped {sp.short}, but too thinly spread to",
+            "point at a spot on the ground - work from `candidates.csv` and the field office.",
+        ]
+    else:
+        lines += [
+            "",
+            f"## {len(picks)} place{'s' if len(picks) > 1 else ''} to scout",
+            "",
+            "The same greedy pick as `scouting.gpx`: best hex cell first, then everything within",
+            f"{MIN_SEPARATION_M // 1000} km of it dropped, repeat — so these are spread across",
+            f"{reg.name} rather than {len(picks)} adjacent cells in one canyon. Coordinates are",
+            "WGS84 and land inside the cell.",
+            "",
+            f"| rank | field office | county | {sp.short} % | {sp.short} acres | dominant type | lat | lon |",
+            "|---:|---|---|---:|---:|---|---:|---:|",
+        ]
+        for _, r in picks.iterrows():
+            lines.append(
+                f"| {r['rank']} | {r['field_office']} | {r['county']} | {r['species_pct']:.0f} | "
+                f"{r['species_acres']:.0f} | {r['dominant_evt']} | {r['lat']:.5f} | {r['lon']:.5f} |"
+            )
     lines += [
         "",
         "## Before you dig",
@@ -171,6 +186,9 @@ def tables(cand, hot, funnel, sp, reg, out):
 
 def waypoints(hot, sp, out):
     picks = spread(hot)
+    if not len(picks):
+        print("  -> no cells over threshold, skipping scouting.kml / scouting.gpx")
+        return
     kml = simplekml.Kml(name=f"{title(sp)} scouting - BLM land")
     gpx = gpxpy.gpx.GPX()
     for _, r in picks.iterrows():
@@ -198,11 +216,62 @@ def waypoints(hot, sp, out):
           f">={MIN_SEPARATION_M/1000:g} km apart)")
 
 
+def nothing_qualified(sp, reg, out):
+    """Stage 03 found no permit-eligible ground. Write the one thing there is to say.
+
+    The funnel is still the deliverable - it shows how far the screening got and where it
+    ran out - so summary.md carries it and the field deliverables are skipped.
+    """
+    # A previous run of this species may have qualified - a threshold moved, or the EVT
+    # keywords changed. Leaving its deliverables next to a summary saying nothing qualified
+    # is the most misleading state this stage can produce, so clear them.
+    for stale in ("candidates.csv", "hotspots.csv", "scouting.kml", "scouting.gpx"):
+        (out / stale).unlink(missing_ok=True)
+
+    funnel = pd.read_csv(out / "funnel.csv")
+    lines = [
+        f"# {title(sp)} on BLM land - transplant permit screening",
+        "",
+        f"**No BLM {reg.name} ground qualified.** Little's *{sp.binomial}* range does reach",
+        f"{reg.name} and the LANDFIRE EVT classes for {sp.short} do exist here, but no BLM",
+        "parcel outside Wilderness / WSA / monument carries enough mapped cover to be worth",
+        "scouting. There is no permit to apply for on this tree in this state.",
+        "",
+        "## How the acreage narrows",
+        "",
+        "| stage | features | acres |",
+        "|---|---:|---:|",
+    ]
+    for _, r in funnel.iterrows():
+        lines.append(f"| {r['stage']} | {int(r['features']):,} | {r['acres']:,.0f} |")
+    lines += [
+        "",
+        "## What this does and does not mean",
+        "",
+        f"* {title(sp)} grows in {reg.name}. The screening says only that it does not grow",
+        "  on *BLM-administered* surface in mapped quantity - most of it is on other ground,",
+        "  typically National Forest, where a different agency issues any permit.",
+        "* Little's range map is 1:2,000,000 (1971) and LANDFIRE EVT is 30 m *modelled* cover.",
+        textwrap.fill(
+            "  Both are screening tools. Ground-truth the species before collecting - "
+            + sp.ground_truth_caveat,
+            width=90, initial_indent="", subsequent_indent="  ",
+            break_on_hyphens=False, break_long_words=False,
+        ),
+        "",
+    ]
+    (out / "summary.md").write_text("\n".join(lines))
+    print(f"{sp.common_name}: nothing qualified -> summary.md (no csv/kml/gpx)")
+
+
 def main():
     sp = species_mod.resolve(sys.argv)
     reg = region_mod.resolve()
     out = paths.out_dir(sp)
     gpkg = paths.gpkg_path(sp)
+
+    if not gpkg.exists():
+        return nothing_qualified(sp, reg, out)
 
     cand = gpd.read_file(gpkg, layer="candidates")
     hot = gpd.read_file(gpkg, layer="hotspots")

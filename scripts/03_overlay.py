@@ -125,8 +125,20 @@ def report(funnel):
         print(f"  {label:<45} {n:>6}  {ac:>12,.0f} acres")
 
 
+def write_funnel(sp, funnel):
+    pd.DataFrame(funnel, columns=["stage", "features", "acres"]).to_csv(
+        paths.out_dir(sp) / "funnel.csv", index=False
+    )
+
+
 def check(cand, funnel, step):
-    """An empty frame here means a filter took everything; say which one."""
+    """A jurisdiction or range filter emptying the frame is a configuration error.
+
+    Reserved for the two geometric filters: if Little's range misses the region entirely,
+    or the exclusions cover all of it, the registry entry or the region is wrong. The
+    third narrowing - no parcel carrying enough mapped cover - is a screening *result* and
+    is handled inline in main(), not here.
+    """
     if len(cand):
         return
     report(funnel)
@@ -215,7 +227,18 @@ def main():
         (f"... with mapped {sp.short} (>={MIN_SPECIES_ACRES} ac)",
          len(cand), cand["species_acres"].sum())
     )
-    check(cand, funnel, f"no parcel carries {MIN_SPECIES_ACRES} acres of mapped {sp.short}")
+    # Not check(): the filters all ran, and no BLM parcel carrying this tree is an answer
+    # about the ground rather than a fault in the setup. Stages 04 and 05 read the missing
+    # GeoPackage as that same answer, so `just all` stays green.
+    if not len(cand):
+        write_funnel(sp, funnel)
+        report(funnel)
+        print(f"\nnothing qualifies: no BLM {reg.name} parcel carries "
+              f"{MIN_SPECIES_ACRES} acres of mapped {sp.short}. The EVT classes matched and "
+              f"Little's range overlaps {reg.name}, so this is a screening result, not a "
+              "misconfiguration - there is simply no permit-eligible ground for this tree.")
+        print(f"\nstage 03 took {fmt(time.time() - started)}")
+        return
 
     # --- who issues the permit -----------------------------------------------
     t = Timer("attaching the field office that issues the permit")
@@ -276,9 +299,7 @@ def main():
         "off-BLM hex cells (context only)",
         len(off_blm), off_blm["species_acres"].sum(),
     ))
-    pd.DataFrame(funnel, columns=["stage", "features", "acres"]).to_csv(
-        paths.out_dir(sp) / "funnel.csv", index=False
-    )
+    write_funnel(sp, funnel)
     report(funnel)
     print(f"\nstage 03 took {fmt(time.time() - started)}")
 

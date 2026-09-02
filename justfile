@@ -18,8 +18,13 @@ setup:
       geopandas rasterio exactextract simplekml gpxpy requests pyogrio
 
 # List the species this pipeline knows how to screen for.
+# every registered plant, with how each one is screened
 species:
     @{{py}} scripts/species.py
+
+# who administers ground in this region, and what may be taken off it
+owners:
+    @{{py}} scripts/ownership.py
 
 # Which LANDFIRE EVT classes a keyword selects - use before adding a species.
 evt-classes *keywords:
@@ -33,7 +38,7 @@ fetch sp="junioste":
 landfire sp="junioste":
     {{py}} scripts/02_landfire.py {{sp}}
 
-# The cross-reference -> out/<sp>/<sp>_blm.gpkg.
+# The cross-reference -> out/<sp>/<sp>.gpkg.
 overlay sp="junioste":
     {{py}} scripts/03_overlay.py {{sp}}
 
@@ -41,7 +46,7 @@ overlay sp="junioste":
 export sp="junioste":
     {{py}} scripts/04_export.py {{sp}}
 
-# The QGIS project -> <sp>_blm.qgs.
+# The QGIS project -> <sp>.qgs.
 qgis sp="junioste":
     {{qgis_py}} scripts/05_qgis_project.py {{sp}}
 
@@ -54,14 +59,14 @@ all-species:
     # Stage 03 is the long pole and runs once per tree. The EVT download is cached
     # region-wide, so only the first species ever pays for it.
     set -euo pipefail
-    for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.SPECIES))'); do
+    for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.TAXA))'); do
       echo "=========== $sp ==========="
       just all "$sp"
     done
 
 # Open the map in QGIS.
 open sp="junioste": (qgis sp)
-    qgis {{sp}}_blm.qgs
+    qgis {{sp}}.qgs
 
 # Print the acreage funnel and summary.
 summary sp="junioste":
@@ -70,7 +75,7 @@ summary sp="junioste":
 # Delete generated outputs; keeps the data/ download cache.
 clean:
     rm -rf out
-    rm -f *_blm.qgs *_blm.qgs~ *_blm_attachments.zip
+    rm -f *.qgs *.qgs~ *_attachments.zip
     find scripts -name __pycache__ -type d -exec rm -rf {} +
 
 # Delete outputs *and* the download cache - next run re-downloads everything.

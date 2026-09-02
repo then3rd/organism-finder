@@ -1,13 +1,23 @@
-"""Cross-reference: BLM-administered surface x Little's range x LANDFIRE stands.
+"""Cross-reference: public surface x the plant's range x where it actually grows.
 
 Three layers doing three different jobs:
-  * BLM SMA          - jurisdiction (who issues the permit)
-  * Little 1971      - species filter (is this the tree's country at all?)
-  * LANDFIRE EVT     - stand locator (does it actually grow on this ground?)
+  * SMA polygons     - jurisdiction (who administers this, and what that permits)
+  * range            - is this the plant's country at all? Little 1971 for a tree,
+                       buffered GBIF records for a plant nobody mapped, nothing when
+                       the region is the range
+  * cover            - does it grow on *this* ground? LANDFIRE EVT for a woody plant,
+                       distance to a record for everything else
 
-Writes out/<slug>/<slug>_blm.gpkg.
+Ownership is a column, not a filter. Every administrator the SMA layer names is carried
+through to the GeoPackage so the map can show the whole public estate; what the taxon's
+`mode` decides is only which of those owners a *candidate* may sit on. A collect-mode
+tree is screened on ground where a plant can lawfully leave, so national parks and
+Wilderness come out; an observe-mode orchid is screened on anything a person may stand
+on, so they stay in.
 
-    .venv/bin/python scripts/03_overlay.py [species-slug]
+Writes out/<slug>/<slug>.gpkg.
+
+    .venv/bin/python scripts/03_overlay.py [taxon-slug]
 """
 from pathlib import Path
 import sys
@@ -16,25 +26,42 @@ import time
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from exactextract import exact_extract
 from shapely.geometry import Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ownership  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
 from common import CRS_LF  # noqa: E402
 
 M2_PER_ACRE = 4046.8564224
-MIN_SPECIES_ACRES = 10      # drop slivers with essentially none of the tree on them
+MIN_SPECIES_ACRES = 10      # drop slivers with essentially none of the plant on them
 HOTSPOT_KM2 = 1.0           # scouting cell area, km2 (flat-top hexagons)
 HOTSPOT_MIN_PCT = 25.0      # a cell must be at least this much cover to be a hotspot
-ZONAL_CHUNK = 2000          # features per exact_extract call - see zonal_species()
-OFFBLM_MIN_ACRES = 25       # same sliver floor as the BLM grid, applied off-BLM
+ZONAL_CHUNK = 2000          # features per exact_extract call - see zonal_evt()
+OTHER_MIN_ACRES = 25        # same sliver floor as the public grid, applied off it
 
 
 def acres(gdf):
     return gdf.geometry.area / M2_PER_ACRE
+
+
+def repair(geoms):
+    """Fix self-intersecting rings in place, quietly.
+
+    GEOS refuses set operations on invalid input with a "side location conflict", and a
+    handful of the published SMA polygons are invalid. A taxon with a range filter never
+    noticed, because intersecting with the range rebuilds the geometry on the way through;
+    one with `range_source=None` hands the raw polygons straight to `difference` and falls
+    over. Repairing on load is cheaper than reasoning about which paths are safe.
+    """
+    bad = ~geoms.is_valid
+    if bad.any():
+        geoms = geoms.copy()
+        geoms[bad] = geoms[bad].make_valid()
+        print(f"  repaired {int(bad.sum())} invalid geometries")
+    return geoms
 
 
 class Timer:
@@ -84,13 +111,22 @@ def hex_cells(bounds, area_m2):
     return cells
 
 
-def zonal_species(gdf, codes, vrt, label="zonal"):
-    """Per-feature cover fraction and dominant community for the species' EVT classes.
+# --- cover: two ways of asking "does it grow here" ----------------------------
+# Both return a frame indexed like their input with the same three columns, so every
+# caller downstream is method-agnostic:
+#   species_pct  0-100, how much of the feature the plant plausibly occupies
+#   evidence     one short string naming what said so
+#   samples      how much evidence there was, for the reader's own judgement
+
+def zonal_evt(gdf, codes, code_name, vrt, label="zonal"):
+    """Per-feature cover fraction and dominant community from the LANDFIRE class grid.
 
     Run in batches of ZONAL_CHUNK: exact_extract has no progress hook of its own, and a
     single call over fifty thousand cells is a quarter-hour of silence. The batching costs
     one call per 2000 features, which is lost in the raster reads.
     """
+    from exactextract import exact_extract
+
     lf = gdf.to_crs(CRS_LF)[["geometry"]]
     n_codes = max(codes) + 1
     frac = np.zeros((len(lf), n_codes))
@@ -112,17 +148,93 @@ def zonal_species(gdf, codes, vrt, label="zonal"):
     return pd.DataFrame(
         {
             "species_pct": species_frac * 100,
-            "dominant_code": dominant,
-            "evt_px": count,
+            "evidence": pd.Series(dominant).map(code_name).to_numpy(),
+            "samples": count,
         },
         index=gdf.index,
-    ), frac
+    )
+
+
+def occurrence_buffers(occ, sp):
+    """One polygon per record, sized by how well that record was located.
+
+    A record's own stated `coordinateUncertaintyInMeters` is the floor: a sighting placed
+    to within 800 m does not become more precise by being buffered to 1000, and one placed
+    to within 1800 m should not pretend to the same 1000 m. Records that state nothing get
+    the taxon default, which is the assumption stage 01 already declined to make.
+    """
+    unc = occ["uncertainty_m"].fillna(sp.occurrence_buffer_m)
+    radius = np.maximum(unc.to_numpy(), sp.occurrence_buffer_m)
+    return gpd.GeoDataFrame(
+        {"radius_m": radius},
+        geometry=occ.geometry.buffer(radius),
+        crs=occ.crs,
+    )
+
+
+def zonal_occurrence(gdf, occ, sp, label="occurrence"):
+    """How much of each feature falls within reach of a documented record.
+
+    This is a far weaker claim than the EVT pass and the numbers should be read that way:
+    `species_pct` here is "share of this polygon somebody has plausibly found the plant
+    in", not modelled cover. Absence of records is absence of *records* - these plants are
+    small, briefly visible and unevenly looked for.
+    """
+    t = Timer(label)
+    buf = occurrence_buffers(occ, sp)
+    buf_union = buf.union_all()
+
+    # only the features that touch a buffer need the expensive intersection
+    inter = np.zeros(len(gdf))
+    hit = gdf.geometry.intersects(buf_union).to_numpy()
+    if hit.any():
+        inter[hit] = gdf.geometry[hit].intersection(buf_union).area.to_numpy()
+
+    # how many records actually sit inside the feature, which is what a reader wants to
+    # know: one 1975 herbarium sheet and twelve recent photographs are not the same cell
+    reps = gpd.GeoDataFrame(geometry=occ.geometry, crs=occ.crs)
+    joined = gpd.sjoin(reps, gdf[["geometry"]], how="inner", predicate="within")
+    counts = joined.groupby("index_right").size()
+    samples = np.zeros(len(gdf))
+    pos = gdf.index.get_indexer(counts.index)
+    samples[pos[pos >= 0]] = counts.to_numpy()[pos >= 0]
+
+    area = gdf.geometry.area.to_numpy()
+    pct = np.divide(inter, area, out=np.zeros_like(inter), where=area > 0) * 100
+    t.done(f"{int(hit.sum()):,} features within reach of a record")
+    return pd.DataFrame(
+        {
+            "species_pct": np.clip(pct, 0, 100),
+            "evidence": [f"{int(n)} record{'s' if n != 1 else ''} in feature"
+                         if n else "within reach of a nearby record" for n in samples],
+            "samples": samples,
+        },
+        index=gdf.index,
+    )
+
+
+def rank_order(sp):
+    """A cell's cover fraction barely varies under occurrence scoring - a 1 km2 cell next
+    to a record is simply inside the buffer - so record count has to lead, or the ranking
+    is a tie broken by area."""
+    if sp.cover == species_mod.OCCURRENCE:
+        return ("samples", "species_pct", "species_acres")
+    return ("species_pct", "species_acres")
+
+
+def cover_scores(gdf, ctx, label):
+    """Score `gdf` by whichever cover method this taxon uses."""
+    sp = ctx["sp"]
+    if sp.cover == species_mod.EVT:
+        return zonal_evt(gdf, sorted(ctx["code_name"]), ctx["code_name"], ctx["vrt"],
+                         label=label)
+    return zonal_occurrence(gdf, ctx["occ"], sp, label=label)
 
 
 def report(funnel):
     print("\nfunnel:")
     for label, n, ac in funnel:
-        print(f"  {label:<45} {n:>6}  {ac:>12,.0f} acres")
+        print(f"  {label:<52} {n:>6}  {ac:>12,.0f} acres")
 
 
 def write_funnel(sp, funnel):
@@ -134,56 +246,134 @@ def write_funnel(sp, funnel):
 def check(cand, funnel, step):
     """A jurisdiction or range filter emptying the frame is a configuration error.
 
-    Reserved for the two geometric filters: if Little's range misses the region entirely,
-    or the exclusions cover all of it, the registry entry or the region is wrong. The
-    third narrowing - no parcel carrying enough mapped cover - is a screening *result* and
-    is handled inline in main(), not here.
+    Reserved for the two geometric filters: if the range misses the region entirely, or
+    the exclusions cover all of it, the registry entry or the region is wrong. The third
+    narrowing - no parcel carrying enough mapped cover - is a screening *result* and is
+    handled inline in main(), not here.
     """
     if len(cand):
         return
     report(funnel)
     raise SystemExit(
         f"nothing survived: {step}. The funnel above shows where it emptied - check the "
-        "species' EVT keywords (`just evt-classes`) and that Little's range actually "
-        "overlaps this region."
+        "taxon's EVT keywords (`just evt-classes`) or GBIF key, and that its range "
+        "actually overlaps this region."
     )
+
+
+DERIVED = ("land_id", "owner", "owner_name", "tenure", "public", "collect")
+
+
+def load_land(raw, reg):
+    """Every SMA polygon, with its administrator resolved against the ownership registry."""
+    land = gpd.read_file(raw / "sma.gpkg", layer="sma").to_crs(reg.crs)
+    codes = land[reg.owner_field].fillna("?")
+    # GeoPackage field names are case-insensitive, and Utah's SMA layer already publishes
+    # an OWNER column (Federal/State/Tribal/Private) that `tenure` supersedes. Writing
+    # both fails at export with a bare "error adding field", so drop the source column
+    # rather than discover the clash three stages downstream.
+    clash = [c for c in land.columns if c.lower() in DERIVED]
+    if clash:
+        land = land.drop(columns=clash)
+    land["geometry"] = repair(land.geometry)
+    land["land_id"] = np.arange(1, len(land) + 1)
+    land["owner"] = codes.to_numpy()
+    owners = land["owner"].map(ownership.owner)
+    land["owner_name"] = [o.name for o in owners]
+    land["tenure"] = [o.tenure for o in owners]
+    land["public"] = [o.public for o in owners]
+    land["collect"] = [o.collect for o in owners]
+    return land
+
+
+def load_range(sp, reg):
+    """The range polygon this taxon is filtered by, or None when it has no range filter."""
+    gpkg = paths.range_gpkg(sp)
+    if sp.range_source == species_mod.LITTLE:
+        return gpd.read_file(gpkg, layer="range").to_crs(reg.crs)
+    if sp.range_source == species_mod.GBIF:
+        occ = gpd.read_file(gpkg, layer="occurrences").to_crs(reg.crs)
+        # the "range" of a plant screened from records is the reach of those records; it
+        # is dissolved so the funnel counts patches of country, not sightings
+        merged = occurrence_buffers(occ, sp).union_all()
+        parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+        return gpd.GeoDataFrame(geometry=parts, crs=reg.crs)
+    return None
 
 
 def main():
     started = time.time()
     sp = species_mod.resolve(sys.argv)
     reg = region_mod.resolve()
-    print(f"== {sp.common_name} ({sp.binomial}) on BLM {reg.name} ==")
     raw = paths.raw_dir(reg)
     vrt = paths.vrt_path(sp)
 
-    codes = pd.read_csv(paths.codes_path(sp))
-    code_name = dict(zip(codes["code"], codes["evt_name"]))
-    code_name[0] = "none"
+    code_name = {0: "none"}
+    occ = None
+    if sp.cover == species_mod.EVT:
+        codes = pd.read_csv(paths.codes_path(sp))
+        code_name.update(dict(zip(codes["code"], codes["evt_name"])))
+    else:
+        occ = gpd.read_file(paths.range_gpkg(sp), layer="occurrences").to_crs(reg.crs)
+    ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ}
 
+    screenable = set(ownership.screenable(sp.mode))
+    print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
+    print(f"   mode={sp.mode}  range={sp.range_source or 'none'}  cover={sp.cover}")
+
+    # --- jurisdiction ---------------------------------------------------------
     t = Timer("reading the jurisdiction layers")
-    blm = gpd.read_file(raw / "blm_sma.gpkg", layer="blm").to_crs(reg.crs)
-    blm["blm_id"] = np.arange(1, len(blm) + 1)
+    land = load_land(raw, reg)
     counties = gpd.read_file(raw / "counties.gpkg", layer="counties").to_crs(reg.crs)
     counties = counties[["NAME", "geometry"]].rename(columns={"NAME": "county"})
-    t.done(f"{len(blm):,} BLM polygons, {len(counties)} counties")
+    public = land[land["public"]].copy()
+    # Captured before any narrowing: the context grid is the complement of this layer's
+    # *universe*, not of the parcels that survived eligibility. A BLM parcel that failed
+    # the cover test is still ground with a BLM permit behind it, so it does not belong
+    # in a grid whose whole meaning is "nobody here can help you".
+    screened_land = land[land["owner"].isin(screenable)].copy()
+    cand = screened_land.copy()
+    t.done(f"{len(land):,} SMA polygons, {len(public):,} public, {len(counties)} counties")
+    print("  screening on: " + ", ".join(
+        f"{o.short}" for _, o in ownership.summarize(sorted(set(cand['owner'])))))
+
     funnel = [
-        (f"BLM-administered surface (SMA {reg.sma_where})", len(blm), acres(blm).sum())
+        (f"{reg.name} surface management polygons", len(land), acres(land).sum()),
+        ("... on public land", len(public), acres(public).sum()),
+        (f"... open to an {sp.mode}-mode screen" if sp.mode[0] in "aeiou"
+         else f"... open to a {sp.mode}-mode screen", len(cand), acres(cand).sum()),
     ]
+    check(cand, funnel, "no public owner is open to this taxon's mode")
 
-    # --- species-range filter -------------------------------------------------
-    t = Timer(f"intersecting BLM surface with Little's {sp.binomial} range")
-    rng = gpd.read_file(paths.range_gpkg(sp), layer="range").to_crs(reg.crs)
-    rng_union = rng.union_all()
-    cand = blm[blm.intersects(rng_union)].copy()
-    cand["geometry"] = cand.geometry.intersection(rng_union)
-    cand = cand[~cand.geometry.is_empty]
-    t.done(f"{len(cand):,} parcels")
-    funnel.append((f"... inside Little's {sp.binomial} range", len(cand), acres(cand).sum()))
-    check(cand, funnel, "Little's range does not overlap BLM surface here")
+    # --- range filter ---------------------------------------------------------
+    rng = load_range(sp, reg)
+    if rng is None:
+        print(f"no range filter for {sp.binomial} - the region is the range")
+    else:
+        src = ("Little's" if sp.range_source == species_mod.LITTLE
+               else "the documented range of")
+        t = Timer(f"intersecting public surface with {src} {sp.binomial} range")
+        rng_union = rng.union_all()
+        cand = cand[cand.intersects(rng_union)].copy()
+        # Clipping to the range is right when the range and the cover come from different
+        # data - Little's polygon knows nothing about LANDFIRE. It is circular when they
+        # come from the same data: an occurrence-screened taxon's range *is* the union of
+        # its cover buffers, so clipping to it would make every parcel 100 % covered by
+        # construction and the ramps would carry no information at all. So select, and
+        # only clip when there is a second opinion to clip against.
+        if sp.cover != species_mod.OCCURRENCE:
+            cand["geometry"] = cand.geometry.intersection(rng_union)
+            cand = cand[~cand.geometry.is_empty]
+        t.done(f"{len(cand):,} parcels")
+        funnel.append((f"... inside the {sp.binomial} range", len(cand),
+                       acres(cand).sum()))
+        check(cand, funnel, "the range does not overlap public surface here")
 
-    # --- legal exclusions -----------------------------------------------------
-    t = Timer("subtracting Wilderness / WSA / NM-NCA")
+    # --- special designations -------------------------------------------------
+    # A bar in collect mode and a flag in observe mode. Wilderness is closed to digging
+    # and open to walking, and an orchid map is about walking, so subtracting it would
+    # remove the best ground on the map for the wrong reason.
+    t = Timer("reading Wilderness / WSA / NM-NCA")
     excl_parts = []
     for layer in ("wilderness", "wsa", "nm_nca"):
         g = gpd.read_file(raw / "nlcs.gpkg", layer=layer).to_crs(reg.crs)
@@ -191,98 +381,122 @@ def main():
             g = g[["geometry"]].copy()
             g["excl_type"] = layer
             excl_parts.append(g)
-    desig_excl = blm[blm["DESIG"].isin(reg.excluded_desig)][["geometry"]].copy()
+    desig_excl = land[land["DESIG"].isin(reg.excluded_desig)][["geometry"]].copy()
     desig_excl["excl_type"] = "sma_designation"
     excl_parts.append(desig_excl)
     exclusions = gpd.GeoDataFrame(pd.concat(excl_parts, ignore_index=True), crs=reg.crs)
+    exclusions["geometry"] = repair(exclusions.geometry)
     excl_union = exclusions.union_all()
+    t.done(f"{len(exclusions):,} polygons")
 
-    cand["geometry"] = cand.geometry.difference(excl_union)
-    cand = cand[~cand.geometry.is_empty].copy()
-    cand = cand.explode(index_parts=False).reset_index(drop=True)
-    cand = cand[cand.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-    cand = cand[acres(cand) >= 1]      # discard difference slivers
-    t.done(f"{len(cand):,} parcels")
-    funnel.append(("... minus Wilderness / WSA / NM-NCA", len(cand), acres(cand).sum()))
-    check(cand, funnel, "the legal exclusions cover everything in range")
+    if sp.mode == species_mod.COLLECT:
+        t = Timer("subtracting Wilderness / WSA / NM-NCA")
+        cand["geometry"] = cand.geometry.difference(excl_union)
+        cand = cand[~cand.geometry.is_empty].copy()
+        cand = cand.explode(index_parts=False).reset_index(drop=True)
+        cand = cand[cand.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+        cand = cand[acres(cand) >= 1]      # discard difference slivers
+        cand["in_excluded"] = False
+        t.done(f"{len(cand):,} parcels")
+        funnel.append(("... minus Wilderness / WSA / NM-NCA", len(cand),
+                       acres(cand).sum()))
+        check(cand, funnel, "the legal exclusions cover everything in range")
+    else:
+        cand = cand.explode(index_parts=False).reset_index(drop=True)
+        cand["in_excluded"] = cand.intersects(excl_union)
+        print(f"  observe mode: keeping {int(cand['in_excluded'].sum()):,} parcels in "
+              "Wilderness / WSA / monument rather than subtracting them")
+        # Not a narrowing step, but the explode above splits multipart parcels, so
+        # without a row here the feature count jumps with nothing to explain it.
+        funnel.append(("... Wilderness / WSA / NM-NCA kept and flagged, parts split",
+                       len(cand), acres(cand).sum()))
 
-    # lands with wilderness characteristics: a flag, not a bar
+    # lands with wilderness characteristics: a flag, not a bar, in either mode
     t = Timer("flagging lands with wilderness characteristics")
     lwc = gpd.read_file(raw / "nlcs.gpkg", layer="lwc").to_crs(reg.crs)
     lwc_union = lwc.union_all()
     cand["in_lwc"] = cand.intersects(lwc_union)
     t.done(f"{int(cand['in_lwc'].sum()):,} flagged")
 
-    # --- LANDFIRE stand locator ----------------------------------------------
-    stats, _ = zonal_species(cand, sorted(code_name), vrt,
-                             label=f"scoring {len(cand):,} parcels against the "
-                                   f"LANDFIRE {sp.short} grid")
+    # --- does it actually grow here -------------------------------------------
+    cand = cand.reset_index(drop=True)
+    stats = cover_scores(cand, ctx, f"scoring {len(cand):,} parcels for {sp.short}")
     cand = pd.concat([cand.reset_index(drop=True), stats.reset_index(drop=True)], axis=1)
     cand = gpd.GeoDataFrame(cand, geometry="geometry", crs=reg.crs)
-    cand["blm_acres"] = acres(cand)
-    cand["species_acres"] = cand["blm_acres"] * cand["species_pct"] / 100
+    cand["land_acres"] = acres(cand)
+    cand["species_acres"] = cand["land_acres"] * cand["species_pct"] / 100
     cand = cand[cand["species_acres"] >= MIN_SPECIES_ACRES].copy()
-    cand["dominant_evt"] = cand["dominant_code"].map(code_name)
     funnel.append(
         (f"... with mapped {sp.short} (>={MIN_SPECIES_ACRES} ac)",
          len(cand), cand["species_acres"].sum())
     )
-    # Not check(): the filters all ran, and no BLM parcel carrying this tree is an answer
-    # about the ground rather than a fault in the setup. Stages 04 and 05 read the missing
-    # GeoPackage as that same answer, so `just all` stays green.
+    # Not check(): the filters all ran, and no public parcel carrying this plant is an
+    # answer about the ground rather than a fault in the setup. Stages 04 and 05 read the
+    # missing GeoPackage as that same answer, so `just all` stays green.
     if not len(cand):
         write_funnel(sp, funnel)
         report(funnel)
-        print(f"\nnothing qualifies: no BLM {reg.name} parcel carries "
-              f"{MIN_SPECIES_ACRES} acres of mapped {sp.short}. The EVT classes matched and "
-              f"Little's range overlaps {reg.name}, so this is a screening result, not a "
-              "misconfiguration - there is simply no permit-eligible ground for this tree.")
+        print(f"\nnothing qualifies: no {reg.name} public parcel carries "
+              f"{MIN_SPECIES_ACRES} acres of mapped {sp.short}. The range overlaps "
+              f"{reg.name} and the cover data exists, so this is a screening result, not "
+              "a misconfiguration.")
         print(f"\nstage 03 took {fmt(time.time() - started)}")
         return
 
-    # --- who issues the permit -----------------------------------------------
-    t = Timer("attaching the field office that issues the permit")
+    # --- who administers it ---------------------------------------------------
+    t = Timer("attaching the administering unit")
     admu = gpd.read_file(raw / "admu.gpkg", layer="boundary").to_crs(reg.crs)
     admu = admu[["ADMU_NAME", "ADM_UNIT_CD", "ADMU_ST_URL", "geometry"]]
+    cand = attach(cand, admu, ["ADMU_NAME", "ADMU_ST_URL"])
+    cand = attach(cand, counties, ["county"])
 
-    reps = cand.copy()
-    reps["geometry"] = cand.representative_point()
-    cand["field_office"] = gpd.sjoin(reps, admu, how="left", predicate="within")[
-        "ADMU_NAME"
-    ].to_numpy()
-    cand["office_url"] = gpd.sjoin(reps, admu, how="left", predicate="within")[
-        "ADMU_ST_URL"
-    ].to_numpy()
-    cand["county"] = gpd.sjoin(reps, counties, how="left", predicate="within")[
-        "county"
-    ].to_numpy()
+    # Only BLM publishes a field-office layer, so only BLM parcels get a named unit. For
+    # everyone else the honest answer is the agency plus what the SMA layer calls the
+    # designation - "U.S. Forest Service / National Forest" - rather than a blank or, far
+    # worse, the BLM field office whose polygon happens to overlap it.
+    is_blm = cand["owner"].eq("BLM")
+    cand["managing_unit"] = np.where(
+        is_blm & cand["ADMU_NAME"].notna(),
+        cand["ADMU_NAME"],
+        cand["owner_name"] + np.where(
+            cand["DESIG"].notna() & cand["DESIG"].ne("N/A"), " / " + cand["DESIG"], ""),
+    )
+    cand["unit_url"] = cand["ADMU_ST_URL"].where(is_blm)
+    cand = cand.drop(columns=["ADMU_NAME", "ADMU_ST_URL"])
+    t.done(f"{cand['managing_unit'].nunique()} distinct units")
 
-    t.done()
     cand = cand.sort_values("species_acres", ascending=False).reset_index(drop=True)
     cand["rank"] = np.arange(1, len(cand) + 1)
     cand = cand[[
-        "rank", "blm_id", "field_office", "office_url", "county", "DESIG", "in_lwc",
-        "blm_acres", "species_acres", "species_pct", "dominant_evt", "geometry",
+        "rank", "land_id", "owner", "owner_name", "tenure", "collect", "managing_unit",
+        "unit_url", "county", "DESIG", "in_lwc", "in_excluded",
+        "land_acres", "species_acres", "species_pct", "evidence", "samples", "geometry",
     ]]
 
     # --- scouting grid --------------------------------------------------------
-    print("\n-- %g km2 hex scouting grid on BLM surface --" % HOTSPOT_KM2, flush=True)
-    hotspots = build_hotspots(cand, code_name, reg, vrt)
+    print("\n-- %g km2 hex scouting grid on screened public surface --" % HOTSPOT_KM2,
+          flush=True)
+    hotspots = build_hotspots(cand, ctx, reg)
 
-    # The same grid over everything that is *not* BLM surface. These cells carry no
-    # jurisdiction - the ground under them is private, state, tribal or another agency's -
-    # so they are context for reading the map, never a permit target. They are built from
-    # the same range x EVT screen so the two grids are directly comparable.
-    print("\n-- the same grid off BLM surface (context only) --", flush=True)
-    off_blm = build_off_blm(blm, rng, counties, code_name, reg, vrt)
+    # The same grid over everything that is *not* screened public surface - private,
+    # tribal, closed withdrawals, and any public owner this taxon's mode rules out. These
+    # cells carry no jurisdiction anyone can act on, so they are context for reading the
+    # map, never a target. Built from the same range x cover screen so the two grids are
+    # directly comparable.
+    print("\n-- the same grid off screened surface (context only) --", flush=True)
+    other = build_other(screened_land, rng, counties, ctx, reg)
 
     gpkg = paths.gpkg_path(sp)
     t = Timer(f"writing {gpkg.relative_to(paths.ROOT)}")
     cand.to_file(gpkg, layer="candidates", driver="GPKG")
     hotspots.to_file(gpkg, layer="hotspots", driver="GPKG")
-    off_blm.to_file(gpkg, layer="off_blm_cells", driver="GPKG")
-    blm.to_file(gpkg, layer="blm_all", driver="GPKG")
-    rng.to_file(gpkg, layer="species_range", driver="GPKG")
+    other.to_file(gpkg, layer="other_cells", driver="GPKG")
+    public.to_file(gpkg, layer="public_land", driver="GPKG")
+    land.to_file(gpkg, layer="land_all", driver="GPKG")
+    if rng is not None:
+        rng.to_file(gpkg, layer="species_range", driver="GPKG")
+    if occ is not None:
+        occ.to_file(gpkg, layer="occurrences", driver="GPKG")
     exclusions.to_file(gpkg, layer="exclusions", driver="GPKG")
     admu.to_file(gpkg, layer="field_offices", driver="GPKG")
     gpd.read_file(raw / "admu.gpkg", layer="office").to_crs(reg.crs).to_file(
@@ -294,23 +508,23 @@ def main():
         "hex cells (%g km2) >= %g%% %s" % (HOTSPOT_KM2, HOTSPOT_MIN_PCT, sp.short),
         len(hotspots), hotspots["species_acres"].sum(),
     ))
-    # below the rule: not a narrowing step, and not permit-eligible ground
+    # below the rule: not a narrowing step, and not ground this screen can act on
     funnel.append((
-        "off-BLM hex cells (context only)",
-        len(off_blm), off_blm["species_acres"].sum(),
+        "hex cells off screened surface (context only)",
+        len(other), other["species_acres"].sum(),
     ))
     write_funnel(sp, funnel)
     report(funnel)
     print(f"\nstage 03 took {fmt(time.time() - started)}")
 
 
-def grid_over(domain, code_name, reg, vrt, min_pct, subtract=None, min_acres=25):
-    """Hex-grid `domain`, score every cell for species cover, keep the ones over `min_pct`.
+def grid_over(domain, ctx, reg, min_pct, subtract=None, min_acres=25):
+    """Hex-grid `domain`, score every cell for cover, keep the ones over `min_pct`.
 
-    Shared by the BLM scouting grid and the off-BLM context grid so the two are scored by
-    exactly the same zonal pass and can be compared cell for cell. `domain` and `subtract`
-    are frames, not merged geometries, and the clipping goes through `overlay` both times:
-    an `intersection` against one unioned polygon is a quarter of a million unindexed
+    Shared by the scouting grid and the context grid so the two are scored by exactly the
+    same pass and can be compared cell for cell. `domain` and `subtract` are frames, not
+    merged geometries, and the clipping goes through `overlay` both times: an
+    `intersection` against one unioned polygon is a quarter of a million unindexed
     pairwise tests against a shape with a million vertices, which is minutes, while the
     indexed pass is seconds.
     """
@@ -334,16 +548,17 @@ def grid_over(domain, code_name, reg, vrt, min_pct, subtract=None, min_acres=25)
     grid = grid.reset_index(drop=True)
     t.done(f"{len(grid):,} cells on the domain")
 
-    if subtract is not None:
-        t = Timer(f"punching out {len(subtract):,} BLM parcels")
+    if subtract is not None and len(subtract):
+        t = Timer(f"punching out {len(subtract):,} screened parcels")
         grid = gpd.overlay(grid, subtract[["geometry"]], how="difference",
                            keep_geom_type=True)
         t.done(f"{len(grid):,} cells left")
     grid = grid[~grid.geometry.is_empty]
     grid = grid[acres(grid) >= min_acres].reset_index(drop=True)   # ignore edge slivers
+    if not len(grid):
+        return grid
 
-    stats, _ = zonal_species(grid, sorted(code_name), vrt,
-                             label=f"scoring {len(grid):,} cells")
+    stats = cover_scores(grid, ctx, f"scoring {len(grid):,} cells")
     grid = gpd.GeoDataFrame(
         pd.concat([grid.reset_index(drop=True), stats.reset_index(drop=True)], axis=1),
         geometry="geometry", crs=reg.crs,
@@ -351,13 +566,12 @@ def grid_over(domain, code_name, reg, vrt, min_pct, subtract=None, min_acres=25)
     grid["cell_acres"] = acres(grid)
     grid["species_acres"] = grid["cell_acres"] * grid["species_pct"] / 100
     grid = grid[grid["species_pct"] >= min_pct].copy()
-    grid["dominant_evt"] = grid["dominant_code"].map(code_name)
     return grid.reset_index(drop=True)
 
 
-def rank_and_locate(grid):
+def rank_and_locate(grid, by=("species_pct", "species_acres")):
     """Rank by cover and stamp lat/lon on the representative point - both grids need it."""
-    grid = grid.sort_values(["species_pct", "species_acres"], ascending=False)
+    grid = grid.sort_values(list(by), ascending=False)
     grid = grid.reset_index(drop=True)
     grid["rank"] = np.arange(1, len(grid) + 1)
     centroids = grid.representative_point().to_crs(4326)
@@ -377,42 +591,56 @@ def attach(grid, source, cols):
     return grid
 
 
-def build_hotspots(cand, code_name, reg, vrt):
-    """Grid the eligible land so there are concrete places to scout, not million-acre blocks."""
-    grid = grid_over(cand, code_name, reg, vrt, HOTSPOT_MIN_PCT)
-    grid = attach(grid, cand, ["field_office", "county"])
-    grid = rank_and_locate(grid).rename(columns={"cell_acres": "blm_acres"})
-    return grid[[
-        "rank", "field_office", "county", "blm_acres", "species_acres",
-        "species_pct", "dominant_evt", "lat", "lon", "geometry",
-    ]]
+HOTSPOT_COLS = [
+    "rank", "owner", "owner_name", "managing_unit", "county", "cell_acres",
+    "species_acres", "species_pct", "evidence", "samples", "lat", "lon", "geometry",
+]
 
 
-def build_off_blm(blm, rng, counties, code_name, reg, vrt):
-    """The same grid over the ground BLM does not administer.
+def empty_cells(reg, cols):
+    return gpd.GeoDataFrame(
+        {c: [] for c in cols if c != "geometry"},
+        geometry=gpd.GeoSeries([], crs=reg.crs), crs=reg.crs,
+    )
 
-    Domain is region x Little's range minus every BLM SMA polygon - the exact complement of
-    the BLM grid's universe, taken before any of the eligibility filters. No field office is
-    attached because there is nobody to issue a permit: these cells say where the tree is,
-    not where it can be dug.
+
+def build_hotspots(cand, ctx, reg):
+    """Grid the eligible land so there are concrete places to go, not million-acre blocks."""
+    grid = grid_over(cand, ctx, reg, HOTSPOT_MIN_PCT)
+    if not len(grid):
+        return empty_cells(reg, HOTSPOT_COLS)
+    grid = attach(grid, cand, ["owner", "owner_name", "managing_unit", "county"])
+    grid = rank_and_locate(grid, rank_order(ctx["sp"]))
+    return grid[HOTSPOT_COLS]
+
+
+def build_other(screened, rng, counties, ctx, reg):
+    """The same grid over the ground this screen cannot act on.
+
+    Domain is the region (narrowed by the range, when there is one) minus every screened
+    parcel. No managing unit is attached because there is nobody to ask: these cells say
+    where the plant is, not where you may go and get it.
     """
-    domain = gpd.overlay(counties[["geometry"]], rng[["geometry"]], how="intersection",
-                         keep_geom_type=True)
+    domain = counties[["geometry"]]
+    if rng is not None:
+        domain = gpd.overlay(domain, rng[["geometry"]], how="intersection",
+                             keep_geom_type=True)
     if domain.empty:
         print("  the range does not reach this region")
-        return gpd.GeoDataFrame(
-            {c: [] for c in ("rank", "county", "cell_acres", "species_acres",
-                             "species_pct", "dominant_evt", "lat", "lon")},
-            geometry=gpd.GeoSeries([], crs=reg.crs), crs=reg.crs,
-        )
-    grid = grid_over(domain, code_name, reg, vrt, HOTSPOT_MIN_PCT,
-                     subtract=blm, min_acres=OFFBLM_MIN_ACRES)
+        return empty_cells(reg, OTHER_COLS)
+    grid = grid_over(domain, ctx, reg, HOTSPOT_MIN_PCT,
+                     subtract=screened, min_acres=OTHER_MIN_ACRES)
+    if not len(grid):
+        return empty_cells(reg, OTHER_COLS)
     grid = attach(grid, counties, ["county"])
-    grid = rank_and_locate(grid)
-    return grid[[
-        "rank", "county", "cell_acres", "species_acres",
-        "species_pct", "dominant_evt", "lat", "lon", "geometry",
-    ]]
+    grid = rank_and_locate(grid, rank_order(ctx["sp"]))
+    return grid[OTHER_COLS]
+
+
+OTHER_COLS = [
+    "rank", "county", "cell_acres", "species_acres", "species_pct", "evidence",
+    "samples", "lat", "lon", "geometry",
+]
 
 
 if __name__ == "__main__":

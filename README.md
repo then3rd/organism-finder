@@ -1,139 +1,151 @@
-# Tree species × BLM Utah land — transplant permit screening
+# Plants × Utah public land — where it grows, and who administers the ground
 
-Finds BLM-administered land in Utah where a given tree actually grows, and tells you which BLM
-field office issues the permit for it. Ships with Utah juniper (*Juniperus osteosperma*) as the
-default and four more Utah trees registered; adding another is a registry entry, not a code
-change.
+Finds **public land** in Utah where a given plant actually grows, and names the agency and
+unit that administers each parcel. Ships Utah juniper (*Juniperus osteosperma*) as the
+default, with twenty-two more taxa registered; adding another is a registry entry, not a
+code change.
 
 ```bash
-just species          # what it knows how to screen for
+just species          # every registered plant, and how each one is screened
+just owners           # who administers ground here, and what may be taken off it
 just all              # Utah juniper
 just all pinuedul     # two-needle pinyon
+just all platdila     # white bog orchid — a different screening method entirely
 ```
 
-## The three layers and what each one is for
+## The three layers
 
 | Layer | Job | Source |
 |---|---|---|
-| BLM Utah Surface Management Agency (polygon) | jurisdiction — who issues the permit | [`BLM_UT_SMA/FeatureServer/0`](https://gis.blm.gov/utarcgis/rest/services/Lands/BLM_UT_SMA/FeatureServer/0) |
-| Little (1971) species range | species filter | Little's *Atlas of United States Trees*, the same polygons as the Data Basin datasets, mirrored as GeoJSON in [`wpetry/USTreeAtlas`](https://github.com/wpetry/USTreeAtlas) |
-| LANDFIRE 2023 Existing Vegetation Type, 30 m | stand locator | [LF2023 EVT CONUS ImageServer](https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2023/LF2023_EVT_CONUS/ImageServer) |
+| Utah Surface Management Agency (polygon) | jurisdiction — who administers it | [`BLM_UT_SMA/FeatureServer/0`](https://gis.blm.gov/utarcgis/rest/services/Lands/BLM_UT_SMA/FeatureServer/0) |
+| range | is this the plant's country at all? | Little (1971) *Atlas of United States Trees*, mirrored as GeoJSON in [`wpetry/USTreeAtlas`](https://github.com/wpetry/USTreeAtlas) — or [GBIF](https://www.gbif.org) occurrence records |
+| cover | does it grow on *this* ground? | [LANDFIRE 2023 EVT CONUS, 30 m](https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2023/LF2023_EVT_CONUS/ImageServer) — or the same GBIF records |
 
-Little's range map alone is not enough: at 1:2,000,000 it blankets most of Utah, so for juniper
-`range ∩ BLM` is ~11 million acres. LANDFIRE narrows that to ground that is genuinely woodland
-of the right type. Little's range still does real work — LANDFIRE class names are *community*
-names, so they cannot tell *J. osteosperma* from *J. scopulorum* / *J. monosperma*, or
-*P. edulis* from *P. monophylla*; the range polygon can.
+Despite the URL, the SMA service is not a BLM layer: it is the whole surface-management
+picture for Utah, 11,687 polygons of which BLM administers 2,171 and the state trust lands
+agency 4,316. Ownership is a column carried end to end, not a download filter, so the map
+shows the entire public estate and the tables say per agency what may be taken off it.
 
-Excluded from results: designated Wilderness, Wilderness Study Areas, and National
-Monuments / National Conservation Areas, plus any SMA polygon carrying those designations.
-Lands with wilderness characteristics are kept but flagged (`in_lwc`).
+No layer can be dropped. Little's range map alone is 1:2,000,000 and blankets most of Utah,
+so for juniper `range ∩ public land` is millions of acres. LANDFIRE narrows that to ground
+genuinely woodland of the right type — but LANDFIRE class names are *community* names, so
+they cannot tell *J. osteosperma* from *J. scopulorum*, which is what the range polygon is
+still doing. And neither says anything about who issues a permit.
 
-## Species
+## Two ways to screen a plant
 
-`scripts/species.py` is the registry. Each entry carries the USTreeAtlas slug (Little's range is
-a URL swap), the LANDFIRE EVT keywords that select the tree's communities, and the
-ground-truthing caveat printed in `summary.md`.
+Little's atlas maps only trees, and LANDFIRE EVT names only woody *communities*. A
+herbaceous plant is invisible to both, so orchids are screened from georeferenced
+occurrence records instead — buffered by each record's own stated accuracy.
 
-The keywords are the part that needs judgment — EVT names a plant community, not a species, and
-some trees have no class of their own at all. Derive them before adding an entry:
+| the plant | range | cover | example |
+|---|---|---|---|
+| a tree with a Little map and an EVT class | Little 1971 | LANDFIRE EVT | `junioste` |
+| a woody plant EVT names but Little never mapped | none — the region is the range | LANDFIRE EVT | `artetrid` |
+| anything herbaceous | buffered GBIF records | the same records | `platdila` |
+
+Occurrence screening is a much weaker claim and the output says so: it records where
+somebody looked and found, not where the plant is. Absence of records is absence of
+records.
+
+For EVT taxa, derive the keywords before writing the entry:
 
 ```bash
-just evt-classes pinyon              # what the attribute table actually calls it
-just evt-classes ponderosa jeffrey
+just evt-classes pinyon            # what the attribute table actually calls it
+just evt-classes big sagebrush
 ```
 
-Both a 404 on the slug and an empty EVT match are hard errors; the pipeline will not hand you a
-plausible-looking empty map.
+Bare keywords are a trap. `sagebrush` matches eight Utah classes and three of them are a
+different shrub (*A. nova*, *A. arbuscula*) on different soils.
 
-Registered, 15 trees covering every tree-bearing EVT class present in Utah:
+A 404 on the slug, an empty EVT match and a GBIF key with no records in the region are all
+hard errors — the pipeline will not hand you a plausible-looking empty map.
+
+## Collect mode and observe mode
+
+Each taxon carries a `mode`, and it is what makes ownership do real work:
+
+* **`collect`** — screens only owners where a plant can lawfully leave, and subtracts
+  Wilderness, WSAs and monuments. Output is permit-oriented: who to apply to, and where.
+* **`observe`** — screens anything the public may stand on, and *keeps* those designations,
+  flagging them instead. Output is a looking map.
+
+Every orchid here is observe mode, and not out of squeamishness: Utah's orchids depend on
+soil fungi that do not come up with the plant, so a transplanted one dies whatever the
+paperwork says. There is nothing to permit, which makes "where may I dig this" the wrong
+question. It is also why an orchid map covers national parks and a juniper transplant map
+does not.
+
+Three taxa are marked `sensitive` — both slipper orchids and *Spiranthes diluvialis*, which
+is federally listed as threatened. The flag is a label, not a filter: they get the same
+full-precision coordinates and the same waypoint files as everything else, and `summary.md`
+says plainly that a list of every known plant is the artifact that gets a population dug out.
+What you do with the file is the control here, not what the pipeline withholds.
+
+## Registered taxa
+
+Fifteen trees, covering every tree-bearing EVT class present in Utah:
 `junioste` Utah juniper · `juniscop` Rocky Mountain juniper · `pinuedul` two-needle pinyon ·
 `pinumono` singleleaf pinyon · `pinupond` ponderosa pine · `pseumenz` Douglas-fir ·
 `pinucont` lodgepole pine · `pinuflex` limber pine · `pinulong` Great Basin bristlecone pine ·
 `piceenge` Engelmann spruce · `abielasi` subalpine fir · `poputrem` quaking aspen ·
 `acergran` bigtooth maple · `quergamb` Gambel oak · `cercledi` curl-leaf mountain mahogany.
 
-Some Utah trees are absent on purpose: no EVT class present in the state names cottonwood or
-white fir, so there is nothing to screen against. A tree with no EVT signal gets no entry.
+One shrub: `artetrid` big sagebrush.
 
-A species whose Little range reaches Utah but whose stands are all off BLM surface — the
-high-elevation conifers, mostly National Forest — is not an error. Stage 03 writes the funnel,
-says nothing qualified, and exits 0; you get a `summary.md` explaining it and no map.
+Seven orchids, all observe mode: `calybulb` fairy slipper · `coramacu` spotted coralroot ·
+`platdila` white bog orchid · `epipgiga` stream orchid · `goodoblo` western rattlesnake
+plantain · `cyprfasc` clustered lady's slipper · `spirdilu` Ute ladies'-tresses.
 
-## Outputs (`out/<slug>/`)
+Some Utah plants are absent on purpose. No EVT class present in the state names cottonwood
+or white fir — the riparian classes are named for the landform — so there is nothing to
+screen a tree against, and a plant with no signal gets no entry rather than a misleading one.
 
-| File | What it is |
+A taxon whose range reaches Utah but whose stands are all off screenable ground is not an
+error. Stage 03 writes the funnel, says so, and exits cleanly without a GeoPackage; stage 04
+writes an explanatory summary and no map.
+
+## Output
+
+Everything lands in `out/<slug>/`:
+
+| file | what |
 |---|---|
-| `<slug>_blm.gpkg` | all layers: `candidates`, `hotspots`, `blm_all`, `species_range`, `exclusions`, `field_offices`, `office_points` |
-| `<slug>_blm.qgs` (repo root) | the map — QGIS project over a Google satellite basemap |
-| `summary.md` | acreage funnel, per-field-office rollup, top scouting cells, caveats |
-| `candidates.csv` | one row per eligible BLM parcel |
-| `hotspots.csv` | one row per 1 km² hex scouting cell ≥ 25 % cover |
-| `scouting.kml` / `.gpx` | 50 waypoints, ≥ 8 km apart, for a phone GPS |
+| `<slug>.gpkg` | every layer: `candidates`, `hotspots`, `other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `exclusions`, `field_offices`, `office_points` |
+| `funnel.csv` | how the acreage narrows, step by step |
+| `summary.md` | per-agency and per-unit rollups, who to ask, and the caveats |
+| `candidates.csv` | one row per eligible public parcel |
+| `hotspots.csv` | one row per 1 km² scouting cell |
+| `scouting.kml` / `.gpx` | spread waypoints for a phone GPS |
 
-`species_pct` / `species_acres` are the cover columns; which tree they refer to is the slug in
-the path.
-
-## Running it
-
-```bash
-just setup            # uv venv + deps
-just all [slug]       # fetch -> landfire -> overlay -> export -> qgis
-just open [slug]      # build the project and open it in QGIS
-```
-
-Stages can be run individually (`just fetch`, `just landfire`, …) or directly, but note the
-two-interpreter split: `01`–`04` need the venv, `05` needs system python because PyQGIS is a
-system package.
-
-```bash
-.venv/bin/python scripts/01_fetch.py junioste      # sources -> data/raw (cached)
-.venv/bin/python scripts/02_landfire.py junioste   # EVT tiles -> data/work/<slug>/class.vrt
-.venv/bin/python scripts/03_overlay.py junioste    # cross-reference -> out/<slug>/<slug>_blm.gpkg
-.venv/bin/python scripts/04_export.py junioste     # csv / md / kml / gpx
-/usr/bin/python3 scripts/05_qgis_project.py junioste
-```
-
-Everything downloaded is cached under `data/` (gitignored); re-runs skip the network. Raw EVT
-tiles are cached per region *before* the species remap, so the first species pays the ~1 GB
-download and every species after it is local work only.
-
-Knobs are constants at the top of `scripts/03_overlay.py`: `MIN_SPECIES_ACRES`, `HOTSPOT_KM2`,
-`HOTSPOT_MIN_PCT`. Jurisdiction, projection and legal exclusions live on the `Region` record in
-`scripts/region.py` — only Utah ships, but every state-specific fact is in that one place.
+The QGIS project is `<slug>.qgs` at the repo root, regenerated by `just qgis <slug>` rather
+than tracked.
 
 ## Colours
 
-The palette is tuned to sit on top of aerial imagery, so it deliberately avoids the hues the
-ground already uses: canopy is green and Utah dirt is brown/tan.
+The palette exists to sit on top of aerial imagery. Adjacent ramp steps hold ΔE ≥ 20 in
+normal vision and ≥ 15.8 under simulated colour-vision deficiency. Magenta is the hex cells,
+cyan the parcels, red the exclusions, violet the range; canopy green and dirt brown are
+avoided because they are the ground itself, which leaves the context grid achromatic.
 
-* **1 km² hex scouting cells** carry the magnitude — a graduated magenta fill on `species_pct`,
-  `#ffb3e0` (25-40 %) → `#4d0038` (85 %+). Breaks start at 25 % because `HOTSPOT_MIN_PCT`
-  already excludes anything below that.
-* **Eligible BLM parcels** carry the same measure at parcel scale, one hue over: a *shapeburst*
-  fill graduated on a cyan ramp, `#d6faff` (0-10 %) → `#00303f` (60 %+), with the boundary line
-  taking the class colour too. The gradient starts at the parcel's outer contour and fades to
-  fully transparent 400 m in. Drawn above the cells; because its middle is transparent it rims
-  the parcel without hiding the cells or the imagery. Cyan has a narrow gamut, so the steps are
-  spread wide to clear the ΔE 15 adjacent-pair floor. The 400 m is in ground metres, so the band
-  follows the contour at working zoom and thins back to the outline statewide — a fixed screen
-  width instead floods every small parcel solid cyan when you zoom out.
+The per-agency ownership wash is the one deliberate exception, and it is safe because that
+layer sits at the bottom at low alpha with agency identity carried by the opaque boundary
+line rather than the fill. Its colours live on the `Owner` records in `scripts/ownership.py`,
+so the map and the tables cannot disagree.
 
-Red (`#ff1744`) is reserved for the excluded areas and violet (`#7c4dff`) outlines Little's range.
+## Knobs
 
-Adjacent ramp steps are ΔE 20 apart in normal vision and 15.8 under simulated colour-vision
-deficiency, and the two ramps sit in different hue families. All colours live in `RAMP_CELLS` /
-`RAMP_PARCELS` / `EXCLUDED` / `RANGE` at the top of `scripts/05_qgis_project.py`.
+`MIN_SPECIES_ACRES`, `HOTSPOT_KM2`, `HOTSPOT_MIN_PCT` and `OTHER_MIN_ACRES` in
+`scripts/03_overlay.py`; `N_WAYPOINTS`, `N_TABLE` and `MIN_SEPARATION_M` in
+`scripts/04_export.py`. Jurisdiction, projection and legal exclusions live on the `Region`
+record in `scripts/region.py` — only Utah ships, but every state-specific fact is in that one
+place. Who counts as public, and what may be taken off each agency's ground, lives on the
+`Owner` records in `scripts/ownership.py`.
 
-## Accuracy caveats
+## Caveats
 
-* Little's range is a hand-drawn 1971 envelope at 1:2M, published in NAD27. It is reprojected
-  to NAD83 / UTM 12N here; the ~100 m datum shift is far below the source's own accuracy.
-* LANDFIRE EVT is *modelled* 30 m vegetation, not a tree inventory, and its classes are plant
-  communities. "Pinyon-juniper woodland" cells contain both pinyon and juniper, and pinyon and
-  juniper runs therefore draw on overlapping classes — it is Little's range that separates them.
-  Each species' registry entry carries its own version of this caveat into `summary.md`.
-* This screening does not model ACECs, grazing/mineral leases, rights-of-way, sage-grouse
-  habitat, developed recreation sites, riparian buffers, or cultural-resource restrictions.
-  **Call the field office before digging** — the permit is theirs to issue and their
-  restrictions are the ones that count.
+This is a screening tool, not an authorization. It does not model ACEC boundaries, grazing or
+mineral leases, rights-of-way, sage-grouse habitat closures, developed recreation sites,
+riparian buffers, or cultural-resource restrictions. LANDFIRE EVT is *modelled* cover and its
+classes are communities rather than species. A permit from one agency is worth nothing on
+another's ground — check whose parcel you are actually standing on.

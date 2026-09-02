@@ -39,7 +39,8 @@ def evt_classes(sp):
             f"{sp.slug}: no LANDFIRE EVT class name matches {list(sp.evt_include)}.\n"
             "Nothing downstream can find this tree. Run `just evt-classes <keyword>` to "
             "see what the attribute table actually calls it, then fix evt_include in "
-            "scripts/species.py - some trees have no EVT class of their own at all."
+            "scripts/species.py. Some plants have no EVT class of their own at all, and "
+            "nothing herbaceous does - those need cover='occurrence' instead."
         )
     return dict(sorted(hits.items()))
 
@@ -112,6 +113,11 @@ def main():
     sp = species_mod.resolve(sys.argv)
     reg = region_mod.resolve()
 
+    if not sp.needs_landfire:
+        print(f"{sp.common_name}: cover='{sp.cover}', so LANDFIRE has nothing to say "
+              "about it - skipping stage 02.")
+        return
+
     hits = evt_classes(sp)
     codes = {v: i + 1 for i, v in enumerate(hits)}
     print(f"{sp.common_name}: {len(hits)} EVT classes")
@@ -126,8 +132,12 @@ def main():
     for value, code in codes.items():
         lut[value] = code
 
-    blm = gpd.read_file(paths.raw_dir(reg) / "blm_sma.gpkg", layer="blm").to_crs(CRS_LF)
-    bounds = np.array(blm.total_bounds) + np.array([-3000, -3000, 3000, 3000])
+    # The AOI is the region, not one agency's holdings. It used to be BLM's extent, which
+    # in Utah happens to approximate the state - but only happens to; any grid laid over
+    # ground BLM does not administer would have read nodata outside that bounding box.
+    counties = gpd.read_file(paths.raw_dir(reg) / "counties.gpkg",
+                             layer="counties").to_crs(CRS_LF)
+    bounds = np.array(counties.total_bounds) + np.array([-3000, -3000, 3000, 3000])
     boxes = tile_bounds(bounds, TILE_PX * RES)
     print(f"AOI {bounds.round(0).tolist()}  ->  {len(boxes)} tiles")
 

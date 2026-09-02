@@ -6,7 +6,9 @@ judgment call. Run this before adding a species to scripts/species.py:
     just evt-classes pinyon
     just evt-classes ponderosa jeffrey
 
-With no keywords, shows what each registered species currently selects.
+With no keywords, shows what each registered taxon currently selects. A taxon screened
+from occurrence records has no EVT keywords at all and is listed as such - LANDFIRE names
+woody communities, so nothing herbaceous will ever match here.
 """
 from pathlib import Path
 import csv
@@ -33,12 +35,16 @@ def main():
     keywords = [k.lower() for k in sys.argv[1:]]
 
     if not keywords:
-        print(f"{len(table)} EVT classes; registered species select:\n")
-        for sp in species_mod.SPECIES.values():
+        print(f"{len(table)} EVT classes; registered taxa select:\n")
+        for sp in species_mod.TAXA.values():
+            if sp.cover != species_mod.EVT:
+                print(f"  {sp.slug:10}   -  {'':8}  {sp.common_name:<28} "
+                      f"[screened from {sp.cover} records]")
+                continue
             hits = [r for r in table if sp.matches(r["EVT_NAME"])]
             kw = " ".join(sp.evt_include)
             kw += "".join(f" -{x}" for x in sp.evt_exclude)
-            print(f"  {sp.slug:10} {len(hits):>3} classes  {sp.common_name:<20} [{kw}]")
+            print(f"  {sp.slug:10} {len(hits):>3} classes  {sp.common_name:<28} [{kw}]")
         print("\nPass keywords to see the class names themselves.")
         return
 

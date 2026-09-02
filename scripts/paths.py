@@ -29,6 +29,11 @@ def species_raw(species):
     return _mk(RAW / "species") / f"{species.slug}.geojson"
 
 
+def occurrence_raw(species, region):
+    """GBIF occurrence records. Region-scoped, because the query is."""
+    return _mk(RAW / "occurrence") / f"{species.slug}_{region.key}.geojson"
+
+
 def evt_csv():
     """The LANDFIRE EVT attribute table. One file for the whole country."""
     return _mk(RAW / "evt") / "LF23_EVT_240.csv"
@@ -63,9 +68,11 @@ def out_dir(species):
     return _mk(OUT / species.slug)
 
 
+# The `_blm` suffix these two carried was accurate when BLM was the only ground screened
+# and is a lie now that every public owner is in the file.
 def gpkg_path(species):
-    return out_dir(species) / f"{species.slug}_blm.gpkg"
+    return out_dir(species) / f"{species.slug}.gpkg"
 
 
 def qgs_path(species):
-    return ROOT / f"{species.slug}_blm.qgs"
+    return ROOT / f"{species.slug}.qgs"

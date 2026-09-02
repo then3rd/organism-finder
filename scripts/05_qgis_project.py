@@ -1,9 +1,10 @@
-"""Build <slug>_blm.qgs from out/<slug>/<slug>_blm.gpkg.
+"""Build <slug>.qgs from out/<slug>/<slug>.gpkg.
 
 Run with the system interpreter (PyQGIS is not in the project venv):
     /usr/bin/python3 scripts/05_qgis_project.py [species-slug]
 
-paths/species/region are standard-library only precisely so this stage can import them.
+paths/species/region/ownership are standard-library only precisely so this stage can
+import them.
 """
 from pathlib import Path
 import os
@@ -18,11 +19,13 @@ from qgis.core import (  # noqa: E402
     QgsVectorLayerSimpleLabeling, QgsCoordinateReferenceSystem,
     QgsCoordinateTransformContext, QgsDatumTransform,
     QgsShapeburstFillSymbolLayer, QgsSimpleLineSymbolLayer, QgsUnitTypes,
+    QgsCategorizedSymbolRenderer, QgsRendererCategory,
 )
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths  # noqa: E402
+import ownership  # noqa: E402
 import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
 
@@ -52,20 +55,19 @@ RAMP_PARCELS = [
 # it follows the contour at working zoom and thins to the outline at statewide zoom,
 # where a fixed screen width would instead flood every small parcel solid cyan
 SHAPEBURST_M = 400
-# The off-BLM context grid. Every hue is spoken for by the time this ramp is placed -
-# magenta and cyan by the two BLM ramps, red by exclusions, violet by Little's range,
-# amber by the BLM wash - and the two that are left, green and brown, are the ground
-# itself. So this ramp is achromatic: lightness is the one channel no ramp above uses as
-# its identity and the one channel every form of colour blindness preserves intact, which
-# is also why the neutral steps hold their spacing under simulated CVD to the decimal.
-# Four classes rather than five because five neutral steps cannot span 0-100 % lightness
-# and still clear the 20 dE adjacent-pair floor; these clear it at ~24.6. Reading grey as
-# "no jurisdiction" is the point - these cells are context, not permit targets.
-RAMP_OFFBLM = [
-    (25, 45, "#fafafa", "off-BLM cell 25-45 % {short}"),
-    (45, 65, "#979797", "off-BLM cell 45-65 %"),
-    (65, 85, "#595959", "off-BLM cell 65-85 %"),
-    (85, 101, "#0a0a0a", "off-BLM cell 85 %+"),
+# The context grid, over ground this screen cannot act on. Every hue is spoken for by the
+# time this ramp is placed - magenta and cyan by the two cell/parcel ramps, red by
+# exclusions, violet by the range - so this ramp is achromatic: lightness is the one
+# channel no ramp above uses as its identity and the one channel every form of colour
+# blindness preserves intact, which is also why the neutral steps hold their spacing under
+# simulated CVD to the decimal. Four classes rather than five because five neutral steps
+# cannot span 0-100 % lightness and still clear the 20 dE adjacent-pair floor; these clear
+# it at ~24.6. Reading grey as "no jurisdiction you can use" is the point.
+RAMP_OTHER = [
+    (25, 45, "#fafafa", "unavailable cell 25-45 % {short}"),
+    (45, 65, "#979797", "unavailable cell 45-65 %"),
+    (65, 85, "#595959", "unavailable cell 65-85 %"),
+    (85, 101, "#0a0a0a", "unavailable cell 85 %+"),
 ]
 EXCLUDED = "#ff1744"
 RANGE = "#7c4dff"
@@ -73,12 +75,19 @@ CASING = "#ffffff"
 # a white hairline vanishes into salt flat and pale playa, so the BLM boundary gets a
 # dark casing under it - the pair reads on bright ground and on canopy alike
 CASING_UNDER = "#101010"
-# Amber wash over every acre of BLM surface, following the convention BLM's own land-status
-# maps use for its holdings. It is the one hue family the ramps left unclaimed - magenta,
-# cyan, red and violet are all spoken for - and it is the bottom vector layer, so the alpha
-# is set low enough that the two ramps still read cleanly through it.
-BLM_WASH = "#ffb300"
-BLM_WASH_ALPHA = 56  # 0-255
+# The ownership wash: one colour per administering agency, taken from the registry in
+# scripts/ownership.py so the map and the tables cannot disagree.
+#
+# This is the one place the hue budget documented above is deliberately overspent, and the
+# reason it is safe here: the wash is the bottom vector layer at alpha 56, and agency
+# identity is carried by the *opaque* casing line rather than by the translucent fill. So
+# ownership may use green, brown and blue - hues the ramps avoid because at full alpha
+# they collide with canopy, dirt and the cyan parcel ramp - without competing with any
+# ramp step. Amber stays BLM's, which is the convention BLM's own land-status maps use.
+# What is not negotiable is that the ramps above keep magenta, cyan, red and violet to
+# themselves; adding a ninth agency means finding a hue outside those four, not borrowing
+# one.
+LAND_WASH_ALPHA = 56  # 0-255
 # QGIS provider strings percent-encode the inner URL: '=' -> %3D, '&' -> %26.
 BASEMAP_CRS = "EPSG:3857"
 GOOGLE_SAT = (
@@ -161,9 +170,10 @@ def shapeburst(color, outline=None, width=0.5, distance_m=SHAPEBURST_M):
 def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None):
     """Flat translucent fill, then a dark casing line, then a lighter line over that.
 
-    Used for the statewide BLM surface, which has to stay legible against imagery that
-    swings from black canopy to white salt without ever competing with the ramps. The
-    alpha rides on the fill colour rather than the symbol, so the boundary stays opaque.
+    Used for the ownership wash, which has to stay legible against imagery that swings
+    from black canopy to white salt without ever competing with the ramps. The alpha rides
+    on the fill colour rather than the symbol, so the boundary stays opaque - which is what
+    lets one agency be told from another at low fill alpha.
     """
     c = QColor(fill_color)
     c.setAlpha(alpha)
@@ -180,12 +190,38 @@ def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None)
     return sym
 
 
+def ownership_renderer(layer, field="owner"):
+    """One category per administering agency actually present in the layer.
+
+    Driven off the data rather than off a fixed list: a region whose SMA layer names an
+    agency the registry has not met still draws, in the registry's `UNKNOWN` grey, and
+    reads as "nobody has checked this" - which is what it is.
+    """
+    idx = layer.fields().indexOf(field)
+    if idx < 0:
+        raise RuntimeError(f"{layer.name()}: no '{field}' field to categorise on")
+    cats = []
+    for code in sorted(layer.uniqueValues(idx), key=lambda c: str(c)):
+        o = ownership.owner(code)
+        sym = washed(o.color, LAND_WASH_ALPHA, o.color, width=0.3)
+        access = "" if o.public else "  (closed)"
+        cats.append(QgsRendererCategory(code, sym, f"{o.short} - {o.name}{access}"))
+    return QgsCategorizedSymbolRenderer(field, cats)
+
+
 def graduated(field, ramp, sp, symbol=fill):
     ranges = [
         QgsRendererRange(lo, hi, symbol(color), label.format(short=sp.short))
         for lo, hi, color, label in ramp
     ]
     return QgsGraduatedSymbolRenderer(field, ranges)
+
+
+def hide(project, layer):
+    """Add a layer to the project but leave it unchecked in the legend."""
+    node = project.layerTreeRoot().findLayer(layer.id())
+    if node:
+        node.setItemVisibilityChecked(False)
 
 
 def add(project, layer, name):
@@ -207,7 +243,7 @@ def main():
     qgs_path = paths.qgs_path(sp)
     if not gpkg.exists():
         # Stage 03 writes funnel.csv either way, so its presence separates "screened, and
-        # no BLM ground qualified" - which has no map to draw - from "never run".
+        # no public ground qualified" - which has no map to draw - from "never run".
         if (paths.out_dir(sp) / "funnel.csv").exists():
             print(f"{sp.common_name}: nothing qualified, no map to draw "
                   f"(see out/{sp.slug}/summary.md)")
@@ -229,43 +265,71 @@ def main():
         best_operation(reg.crs, BASEMAP_CRS),
     )
     project.setTransformContext(ctx)
-    project.setTitle(f"{tree} on BLM land - transplant permit screening")
+    what = ("transplant permit screening" if sp.mode == species_mod.COLLECT
+            else "where to go and look")
+    project.setTitle(f"{tree} on {reg.name} public land - {what}")
 
     basemap = QgsRasterLayer(GOOGLE_SAT, "Google Satellite", "wms")
     if not basemap.isValid():
         raise RuntimeError("Google satellite basemap failed to load")
     project.addMapLayer(basemap)
 
-    blm = add(project, gpkg_layer(gpkg, "blm_all"), "All BLM surface")
-    blm.setRenderer(QgsSingleSymbolRenderer(
-        washed(BLM_WASH, BLM_WASH_ALPHA, CASING, width=0.3)))
+    # Everything the SMA layer names, private included, so the map can answer "why does
+    # the stand stop here". Off by default: it is the busiest layer in the file and its
+    # only job is to be switched on when a boundary looks arbitrary.
+    all_land = add(project, gpkg_layer(gpkg, "land_all"),
+                   "All surface management (incl. private)")
+    all_land.setRenderer(ownership_renderer(all_land))
+    hide(project, all_land)
 
-    rng = add(project, gpkg_layer(gpkg, "species_range"),
-              f"Little 1971 {sp.binomial} range")
-    rng.setRenderer(QgsSingleSymbolRenderer(
-        fill("#00000000", outline=RANGE, width=0.6, style="no")))
+    public = add(project, gpkg_layer(gpkg, "public_land"),
+                 "Public land (by administrator)")
+    public.setRenderer(ownership_renderer(public))
 
-    excl = add(project, gpkg_layer(gpkg, "exclusions"),
-               "Excluded: Wilderness / WSA / NM-NCA")
+    # A taxon with no range filter has no range layer, and a taxon screened from records
+    # has one that means something different, so the layer is named for what it is.
+    rng = gpkg_layer(gpkg, "species_range")
+    if rng.isValid() and rng.featureCount():
+        label_rng = (f"Little 1971 {sp.binomial} range"
+                     if sp.range_source == species_mod.LITTLE
+                     else f"Documented range of {sp.binomial} (buffered records)")
+        add(project, rng, label_rng)
+        rng.setRenderer(QgsSingleSymbolRenderer(
+            fill("#00000000", outline=RANGE, width=0.6, style="no")))
+
+    excl_name = ("Excluded: Wilderness / WSA / NM-NCA" if sp.mode == species_mod.COLLECT
+                 else "Wilderness / WSA / NM-NCA (open to visit)")
+    excl = add(project, gpkg_layer(gpkg, "exclusions"), excl_name)
     excl.setRenderer(QgsSingleSymbolRenderer(
         fill(EXCLUDED, outline=EXCLUDED, width=0.3, style="b_diagonal", opacity=0.6)))
 
-    off = gpkg_layer(gpkg, "off_blm_cells")
-    if off.isValid() and off.featureCount():
-        add(project, off, f"Off-BLM cells (1 km² hex, {sp.short} %) - no permit")
-        off.setRenderer(graduated("species_pct", RAMP_OFFBLM, sp, cell_fill))
-        off.setOpacity(0.55)
+    other = gpkg_layer(gpkg, "other_cells")
+    if other.isValid() and other.featureCount():
+        add(project, other, f"Cells off screened land (1 km² hex, {sp.short} %)")
+        other.setRenderer(graduated("species_pct", RAMP_OTHER, sp, cell_fill))
+        other.setOpacity(0.55)
 
+    cells_name = ("Scouting cells" if sp.mode == species_mod.COLLECT else "Viewing cells")
     hot = add(project, gpkg_layer(gpkg, "hotspots"),
-              f"Scouting cells (1 km² hex, {sp.short} %)")
+              f"{cells_name} (1 km² hex, {sp.short} %)")
     hot.setRenderer(graduated("species_pct", RAMP_CELLS, sp, cell_fill))
     hot.setOpacity(0.65)
 
     # added after the cells so it draws on top: the gradient is transparent in the
     # middle, so it rims the parcel without hiding the cells inside it
     cand = add(project, gpkg_layer(gpkg, "candidates"),
-               f"Eligible BLM parcels ({sp.short} %)")
+               f"Eligible public parcels ({sp.short} %)")
     cand.setRenderer(graduated("species_pct", RAMP_PARCELS, sp, shapeburst))
+
+    # The records themselves, on top of everything they generated, so the reader can see
+    # how thin the evidence for a cell actually is.
+    occ = gpkg_layer(gpkg, "occurrences")
+    if occ.isValid() and occ.featureCount():
+        add(project, occ, f"GBIF records ({occ.featureCount()})")
+        occ.setRenderer(QgsSingleSymbolRenderer(QgsMarkerSymbol.createSimple(
+            {"name": "circle", "color": RANGE, "outline_color": "#ffffff",
+             "outline_width": "0.3", "size": "2"}
+        )))
 
     offices = add(project, gpkg_layer(gpkg, "office_points"), "BLM offices")
     offices.setRenderer(QgsSingleSymbolRenderer(QgsMarkerSymbol.createSimple(

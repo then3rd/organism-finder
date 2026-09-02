@@ -1,8 +1,12 @@
 """Download and cache every source layer used by the overlay.
 
-Jurisdiction layers are per-region, Little's range polygons are per-species, and the
-LANDFIRE attribute table is neither. Everything is cached on disk; re-runs are free
-unless you delete data/raw.
+Jurisdiction layers are per-region, the range layer is per-taxon, and the LANDFIRE
+attribute table is neither. Everything is cached on disk; re-runs are free unless you
+delete data/raw.
+
+Where the range comes from is the taxon's `range_source`: Little's atlas for a tree, GBIF
+occurrence records for a plant nobody drew a range map for, or nothing at all when the
+region is the range. See scripts/species.py.
 
     .venv/bin/python scripts/01_fetch.py [species-slug]
 """
@@ -10,6 +14,7 @@ from pathlib import Path
 import sys
 
 import geopandas as gpd
+import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths  # noqa: E402
@@ -18,6 +23,8 @@ import species as species_mod  # noqa: E402
 from common import esri_count, esri_features, get  # noqa: E402
 
 EVT_CSV = "https://landfire.gov/sites/default/files/CSV/LF2023/LF23_EVT_240.csv"
+GBIF_SEARCH = "https://api.gbif.org/v1/occurrence/search"
+GBIF_PAGE = 300     # the API's own maximum
 
 
 def save(gdf, path, layer=None):
@@ -48,11 +55,18 @@ def fetch_layer(url, path, layer, crs, where="1=1"):
 def fetch_region(reg):
     raw = paths.raw_dir(reg)
 
-    print(f"BLM surface management agency ({reg.sma_where})")
-    expected = esri_count(reg.blm_sma, reg.sma_where)
-    print(f"  server reports {expected} BLM-administered polygons")
-    blm = fetch_layer(reg.blm_sma, raw / "blm_sma.gpkg", "blm", reg.crs, where=reg.sma_where)
-    assert len(blm) == expected, f"paging lost features: {len(blm)} != {expected}"
+    # The whole surface-management picture, every administrator, not just BLM's share of
+    # it. Ownership is a column downstream; filtering it away here would make the other
+    # nine tenths of the state invisible rather than merely unscreened.
+    print(f"surface management agency ({reg.sma_where})")
+    expected = esri_count(reg.sma, reg.sma_where)
+    print(f"  server reports {expected} polygons")
+    sma = fetch_layer(reg.sma, raw / "sma.gpkg", "sma", reg.crs, where=reg.sma_where)
+    assert len(sma) == expected, f"paging lost features: {len(sma)} != {expected}"
+    if reg.owner_field in sma.columns:
+        counts = sma[reg.owner_field].value_counts()
+        print("  administrators: "
+              + ", ".join(f"{k} {v}" for k, v in counts.items()))
 
     print("BLM administrative units")
     fetch_layer(reg.admu_boundary, raw / "admu.gpkg", "boundary", reg.crs)
@@ -67,7 +81,76 @@ def fetch_region(reg):
                 where=reg.counties_where)
 
 
-def fetch_range(sp, reg):
+def fetch_occurrences(sp, reg):
+    """Georeferenced GBIF records for one taxon in one state.
+
+    The range layer for a plant nobody mapped. Each record becomes a point, and stage 03
+    buffers it by the taxon's `occurrence_buffer_m` to get something polygonal to
+    intersect - so this is a statement about where the plant has been *seen*, which is a
+    weaker and more honest claim than a drawn range.
+    """
+    print(f"GBIF occurrence records for {sp.binomial} (taxonKey {sp.gbif_key})")
+    cache = paths.occurrence_raw(sp, reg)
+    if not cache.exists():
+        feats, offset = [], 0
+        while True:
+            data = get(GBIF_SEARCH, params={
+                "taxonKey": sp.gbif_key,
+                "country": "US",
+                "stateProvince": reg.gbif_state,
+                "hasCoordinate": "true",
+                "hasGeospatialIssue": "false",
+                "occurrenceStatus": "PRESENT",
+                "limit": GBIF_PAGE,
+                "offset": offset,
+            }).json()
+            for r in data["results"]:
+                feats.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Point",
+                                 "coordinates": [r["decimalLongitude"],
+                                                 r["decimalLatitude"]]},
+                    "properties": {
+                        "gbif_id": r.get("key"),
+                        "year": r.get("year"),
+                        # often absent; see the null handling below
+                        "uncertainty_m": r.get("coordinateUncertaintyInMeters"),
+                        "basis": r.get("basisOfRecord"),
+                        "dataset": r.get("datasetName") or r.get("publishingOrgKey"),
+                    },
+                })
+            offset += len(data["results"])
+            print(f"    ... {offset}/{data['count']} records", flush=True)
+            if data.get("endOfRecords") or not data["results"]:
+                break
+        cache.write_text(json.dumps({"type": "FeatureCollection", "features": feats}))
+    occ = gpd.read_file(cache)
+    print(f"  {len(occ)} records in {reg.name}")
+    if occ.empty:
+        raise SystemExit(
+            f"{sp.slug}: GBIF has no georeferenced {reg.name} records for taxonKey "
+            f"{sp.gbif_key}. Either the key is wrong or the plant is not recorded here - "
+            "check https://api.gbif.org/v1/species/{key} before assuming the former."
+        )
+
+    # A record with no stated uncertainty is kept rather than dropped: iNaturalist
+    # research-grade observations routinely omit the field, and they are the bulk of the
+    # modern records for these plants. Stage 03 buffers a null by the taxon default, so
+    # keeping it asserts no more precision than dropping it would have denied.
+    loose = occ["uncertainty_m"].notna() & (occ["uncertainty_m"] > sp.max_uncertainty_m)
+    print(f"  dropping {int(loose.sum())} records looser than "
+          f"{sp.max_uncertainty_m} m; {int(occ['uncertainty_m'].isna().sum())} state none")
+    occ = occ[~loose].to_crs(reg.crs)
+    if occ.empty:
+        raise SystemExit(
+            f"{sp.slug}: every {reg.name} record is looser than "
+            f"{sp.max_uncertainty_m} m. Raise max_uncertainty_m if a coarser map is still "
+            "worth having, but know that is what you are making."
+        )
+    save(occ, paths.range_gpkg(sp), "occurrences")
+
+
+def fetch_little(sp, reg):
     """Little (1971) Atlas of United States Trees, one species' range polygons.
 
     Same polygons as the Data Basin datasets, but downloadable anonymously.
@@ -97,19 +180,33 @@ def fetch_range(sp, reg):
     save(rng, paths.range_gpkg(sp), "range")
 
 
+def fetch_range(sp, reg):
+    """Dispatch on the taxon's range source; None means the region is the range."""
+    if sp.range_source == species_mod.LITTLE:
+        fetch_little(sp, reg)
+    elif sp.range_source == species_mod.GBIF:
+        fetch_occurrences(sp, reg)
+    else:
+        print(f"no range filter for {sp.binomial} - the region is the range")
+    if sp.cover == species_mod.OCCURRENCE and sp.range_source != species_mod.GBIF:
+        # cover='occurrence' scores against the records themselves, so they have to exist
+        fetch_occurrences(sp, reg)
+
+
 def main():
     sp = species_mod.resolve(sys.argv)
     reg = region_mod.resolve()
-    print(f"== {sp.common_name} ({sp.binomial}) on BLM {reg.name} ==")
+    print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
 
     fetch_region(reg)
     fetch_range(sp, reg)
 
-    print("LANDFIRE EVT attribute table")
-    csv = paths.evt_csv()
-    if not csv.exists():
-        csv.write_bytes(get(EVT_CSV).content)
-    print(f"  -> {csv.name} ({csv.stat().st_size} bytes)")
+    if sp.needs_landfire:
+        print("LANDFIRE EVT attribute table")
+        csv = paths.evt_csv()
+        if not csv.exists():
+            csv.write_bytes(get(EVT_CSV).content)
+        print(f"  -> {csv.name} ({csv.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

@@ -55,21 +55,27 @@ RAMP_PARCELS = [
 # it follows the contour at working zoom and thins to the outline at statewide zoom,
 # where a fixed screen width would instead flood every small parcel solid cyan
 SHAPEBURST_M = 400
-# The context grid, over ground this screen cannot act on. Every hue is spoken for by the
-# time this ramp is placed - magenta and cyan by the two cell/parcel ramps, red by
-# exclusions, violet by the range - so this ramp is achromatic: lightness is the one
-# channel no ramp above uses as its identity and the one channel every form of colour
-# blindness preserves intact, which is also why the neutral steps hold their spacing under
-# simulated CVD to the decimal. Four classes rather than five because five neutral steps
-# cannot span 0-100 % lightness and still clear the 20 dE adjacent-pair floor; these clear
-# it at ~24.6. Reading grey as "no jurisdiction you can use" is the point.
+# The context grid, over ground this screen cannot act on. This ramp is red, and exclusions
+# took the neutral slot it used to hold - the grid is the larger area by far and an
+# achromatic wash disappeared into snow, playa and pale rock. What carries the ramp is still
+# lightness, not hue (L* ~ 92 / 58 / 36 / 4): hue is the channel colour blindness takes away
+# and lightness the one it leaves, so red is a tint over a lightness ramp rather than the
+# ramp itself. Saturated reds at even lightness steps collapse to ~8 dE under simulated
+# tritanopia; these hold 21.4 dE adjacent in normal vision and 16.5 under CVD. Four classes
+# rather than five because five cannot span the lightness range and still clear the floor.
+# The first step is as saturated as L* 92 allows - the sRGB gamut runs out above that, and
+# buying more chroma by darkening it costs the pair its margin against the magenta cells.
 RAMP_OTHER = [
-    (25, 45, "#fafafa", "unavailable cell 25-45 % {short}"),
-    (45, 65, "#979797", "unavailable cell 45-65 %"),
-    (65, 85, "#595959", "unavailable cell 65-85 %"),
-    (85, 101, "#0a0a0a", "unavailable cell 85 %+"),
+    (25, 45, "#ffdede", "unavailable cell 25-45 % {short}"),
+    (45, 65, "#dc6670", "unavailable cell 45-65 %"),
+    (65, 85, "#9d283b", "unavailable cell 65-85 %"),
+    (85, 101, "#230404", "unavailable cell 85 %+"),
 ]
-EXCLUDED = "#ff1744"
+# Near-black rather than red: exclusions and the context grid genuinely overlap - stage 03
+# subtracts screenable *owners* from that grid, not exclusion geometry, so all NPS and USFWS
+# Wilderness lies under both - and red is now the grid's. Hatch texture over a solid fill is
+# what tells the two apart, so the hue only has to stay out of the way.
+EXCLUDED = "#141414"
 RANGE = "#7c4dff"
 CASING = "#ffffff"
 # a white hairline vanishes into salt flat and pale playa, so the BLM boundary gets a
@@ -297,17 +303,20 @@ def main():
         rng.setRenderer(QgsSingleSymbolRenderer(
             fill("#00000000", outline=RANGE, width=0.6, style="no")))
 
-    excl_name = ("Excluded: Wilderness / WSA / NM-NCA" if sp.mode == species_mod.COLLECT
-                 else "Wilderness / WSA / NM-NCA (open to visit)")
-    excl = add(project, gpkg_layer(gpkg, "exclusions"), excl_name)
-    excl.setRenderer(QgsSingleSymbolRenderer(
-        fill(EXCLUDED, outline=EXCLUDED, width=0.3, style="b_diagonal", opacity=0.6)))
-
     other = gpkg_layer(gpkg, "other_cells")
     if other.isValid() and other.featureCount():
         add(project, other, f"Cells off screened land (1 km² hex, {sp.short} %)")
         other.setRenderer(graduated("species_pct", RAMP_OTHER, sp, cell_fill))
         other.setOpacity(0.55)
+
+    # added after the context grid so the hatch draws on top of it: the two overlap wherever
+    # an exclusion sits on ground no screenable owner administers, and underneath a
+    # translucent grid the hatch would be the thing that disappears
+    excl_name = ("Excluded: Wilderness / WSA / NM-NCA" if sp.mode == species_mod.COLLECT
+                 else "Wilderness / WSA / NM-NCA (open to visit)")
+    excl = add(project, gpkg_layer(gpkg, "exclusions"), excl_name)
+    excl.setRenderer(QgsSingleSymbolRenderer(
+        fill(EXCLUDED, outline=EXCLUDED, width=0.3, style="b_diagonal", opacity=0.6)))
 
     cells_name = ("Scouting cells" if sp.mode == species_mod.COLLECT else "Viewing cells")
     hot = add(project, gpkg_layer(gpkg, "hotspots"),

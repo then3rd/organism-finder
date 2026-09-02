@@ -125,8 +125,11 @@ than tracked.
 
 The palette exists to sit on top of aerial imagery. Adjacent ramp steps hold ΔE ≥ 20 in
 normal vision and ≥ 15.8 under simulated colour-vision deficiency. Magenta is the hex cells,
-cyan the parcels, red the exclusions, violet the range; canopy green and dirt brown are
-avoided because they are the ground itself, which leaves the context grid achromatic.
+cyan the parcels, red the context grid, violet the range; canopy green and dirt brown are
+avoided because they are the ground itself. Exclusions are a near-black hatch — they are
+identified by texture, so they can give red up to the context grid, which is far the larger
+area and vanished into snow and pale rock while it was grey. Red there is a tint over a
+lightness ramp, because lightness is the channel colour blindness leaves intact.
 
 The per-agency ownership wash is the one deliberate exception, and it is safe because that
 layer sits at the bottom at low alpha with agency identity carried by the opaque boundary

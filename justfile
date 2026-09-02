@@ -64,6 +64,14 @@ all-species:
       just all "$sp"
     done
 
+# Every species' map, from the GeoPackages stage 03 already wrote - for styling changes.
+qgis-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.TAXA))'); do
+      just qgis "$sp"
+    done
+
 # Open the map in QGIS.
 open sp="junioste": (qgis sp)
     qgis {{sp}}.qgs

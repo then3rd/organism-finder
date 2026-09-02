@@ -231,10 +231,18 @@ The whole stage is a no-op for a taxon whose `cover` is not `EVT`.
 The palette exists to sit on top of aerial imagery, so changes to it are not free. Adjacent
 ramp steps hold ΔE ≥ 20 in normal vision and ≥ 15.8 under simulated CVD, and the ramps
 occupy different hue families deliberately: canopy is green and Utah dirt is brown/tan, so
-those hues are avoided; red is reserved for exclusions and violet for the range. That exhausts
-the hue budget, so `RAMP_OTHER` is achromatic — four neutral steps, because five cannot span
-the lightness range and still clear ΔE 20. Grey reading as "no jurisdiction you can use" is
-deliberate.
+those hues are avoided; violet is reserved for the range. `RAMP_OTHER` holds red — four steps,
+because five cannot span the lightness range and still clear ΔE 20 — and exclusions take the
+neutral slot the context grid used to hold. The grid is far the larger area and an achromatic
+wash disappeared into snow, playa and pale rock; exclusions are a hatch, so texture rather
+than hue is what identifies them and a near-black is enough.
+
+What still carries `RAMP_OTHER` is **lightness, not hue**. Hue is the channel colour blindness
+takes away and lightness the one it leaves, so red is a tint applied over a lightness ramp
+rather than the ramp itself — a saturated red at even lightness steps collapses to ΔE ~8 under
+simulated tritanopia. The same reasoning constrains its lightest step: the sRGB gamut allows
+almost no chroma above L\* 92, and buying more by darkening that step costs the pair its
+margin against the magenta cells.
 
 **The ownership wash is the one deliberate exception**, and the reason it is safe: it is the
 bottom vector layer at alpha 56, and agency identity is carried by the *opaque* casing line

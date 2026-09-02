@@ -8,6 +8,10 @@ Where the range comes from is the taxon's `range_source`: Little's atlas for a t
 occurrence records for a plant nobody drew a range map for, or nothing at all when the
 region is the range. See scripts/species.py.
 
+A taxon carrying habitat conditions also pulls the layers those need - fire perimeters,
+hydrography - and only the kinds it actually uses, the same way stage 02 is a no-op for a
+taxon LANDFIRE cannot see.
+
     .venv/bin/python scripts/01_fetch.py [species-slug]
 """
 from pathlib import Path
@@ -17,6 +21,7 @@ import geopandas as gpd
 import json
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import habitat  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
@@ -32,7 +37,7 @@ def save(gdf, path, layer=None):
     print(f"  -> {path.name}:{layer or path.stem}  n={len(gdf)}  crs={gdf.crs.to_string()}")
 
 
-def fetch_layer(url, path, layer, crs, where="1=1"):
+def fetch_layer(url, path, layer, crs, where="1=1", bbox=None):
     if path.exists():
         try:
             existing = gpd.read_file(path, layer=layer)
@@ -41,7 +46,7 @@ def fetch_layer(url, path, layer, crs, where="1=1"):
         except Exception:
             pass
     print(f"  querying {layer} ...", flush=True)
-    fc = esri_features(url, where=where)
+    fc = esri_features(url, where=where, bbox=bbox)
     if not fc["features"]:
         # e.g. Utah has no mapped wild & scenic river corridor polygons
         print(f"  {layer}: service returned 0 features - writing empty layer")
@@ -180,6 +185,54 @@ def fetch_little(sp, reg):
     save(rng, paths.range_gpkg(sp), "range")
 
 
+def region_bbox(reg):
+    """The region envelope in WGS84, from the counties layer stage 01 has already got.
+
+    Read off the data rather than written down, so it is right for the next region
+    without anybody remembering to type in a bounding box.
+    """
+    counties = gpd.read_file(paths.raw_dir(reg) / "counties.gpkg", layer="counties")
+    return tuple(counties.to_crs("EPSG:4326").total_bounds)
+
+
+def fetch_conditions(sp, reg):
+    """The layers this taxon's habitat conditions need, and no others."""
+    kinds = habitat.kinds(sp.conditions)
+    if not kinds:
+        return
+    bbox = region_bbox(reg)
+
+    if habitat.BURN in kinds:
+        print("fire perimeter history (NIFC)")
+        # National service, so the envelope is doing real work here. Every year is
+        # fetched, not just the current window: the window moves with the calendar and a
+        # cache keyed to this year's answer would quietly go stale next spring.
+        fire = fetch_layer(
+            reg.fire_perims, paths.fire_gpkg(reg), "perimeters", reg.crs,
+            where=reg.fire_where, bbox=bbox,
+        )
+        if not len(fire):
+            raise SystemExit(
+                f"{reg.name}: fire perimeter service returned nothing - a burn condition "
+                "cannot be screened without it"
+            )
+
+    if habitat.WATER in kinds:
+        print("NHD perennial hydrography")
+        lines = fetch_layer(
+            reg.hydro_flowline, paths.water_gpkg(reg), "flowlines", reg.crs,
+            where=reg.flowline_where, bbox=bbox,
+        )
+        bodies = fetch_layer(
+            reg.hydro_waterbody, paths.water_gpkg(reg), "waterbodies", reg.crs,
+            where=reg.waterbody_where, bbox=bbox,
+        )
+        if not len(lines) and not len(bodies):
+            raise SystemExit(
+                f"{reg.name}: no perennial water returned - check Region.flowline_where"
+            )
+
+
 def fetch_range(sp, reg):
     """Dispatch on the taxon's range source; None means the region is the range."""
     if sp.range_source == species_mod.LITTLE:
@@ -200,6 +253,7 @@ def main():
 
     fetch_region(reg)
     fetch_range(sp, reg)
+    fetch_conditions(sp, reg)
 
     if sp.needs_landfire:
         print("LANDFIRE EVT attribute table")

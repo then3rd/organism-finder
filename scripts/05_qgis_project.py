@@ -7,6 +7,7 @@ paths/species/region/ownership are standard-library only precisely so this stage
 import them.
 """
 from pathlib import Path
+import datetime
 import os
 import sys
 
@@ -24,6 +25,7 @@ from qgis.core import (  # noqa: E402
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import habitat  # noqa: E402
 import paths  # noqa: E402
 import ownership  # noqa: E402
 import region as region_mod  # noqa: E402
@@ -76,6 +78,13 @@ RAMP_OTHER = [
 # Wilderness lies under both - and red is now the grid's. Hatch texture over a solid fill is
 # what tells the two apart, so the hue only has to stay out of the way.
 EXCLUDED = "#141414"
+# Burn perimeters. Outline-only at full alpha, which is why an orange is affordable at
+# all: the four ramps own magenta, cyan, red and violet as *fills*, and the ownership
+# wash owns amber at alpha 56, so a hard 0.7 mm line at full saturation reads as its own
+# thing against BLM's translucent yellow rather than competing with it. It is the only
+# new hue this file has spent since the ramps were fixed, and it buys the one thing a
+# forager needs to see at a glance: which side of the fire edge they are on.
+BURN = "#e65100"
 RANGE = "#7c4dff"
 CASING = "#ffffff"
 # a white hairline vanishes into salt flat and pale playa, so the BLM boundary gets a
@@ -318,7 +327,32 @@ def main():
     excl.setRenderer(QgsSingleSymbolRenderer(
         fill(EXCLUDED, outline=EXCLUDED, width=0.3, style="b_diagonal", opacity=0.6)))
 
-    cells_name = ("Scouting cells" if sp.mode == species_mod.COLLECT else "Viewing cells")
+    # The water buffer is added and hidden, the way land_all is. Open water is already
+    # legible on the imagery, and what the map has to *show* is the buffer's consequence -
+    # which cells survived - not the buffer itself. Carrying it as a switchable layer means
+    # a result can be inspected without spending a hue the ramps would then have to avoid.
+    water = gpkg_layer(gpkg, "water_buffer")
+    if water.isValid() and water.featureCount():
+        w = add(project, water, "Perennial water buffer (screen input)")
+        w.setRenderer(QgsSingleSymbolRenderer(
+            fill("#00000000", outline="#0d47a1", width=0.3, style="no")))
+        hide(project, w)
+
+    # Under the cells rather than over them: the cells are the answer and the perimeter is
+    # the reason, so the perimeter frames them instead of cutting across them.
+    burns = gpkg_layer(gpkg, "burns")
+    if burns.isValid() and burns.featureCount():
+        window = next((c for c in sp.conditions if c.kind == habitat.BURN), None)
+        # `label()` already reads as a phrase - "burned 1-3 season(s) ago (fire years
+        # 2023-2025)" - so wrapping it in another bracket doubles them.
+        add(project, burns,
+            f"Burn perimeters: {window.label(datetime.date.today().year)}"
+            if window else "Burn perimeters")
+        burns.setRenderer(QgsSingleSymbolRenderer(
+            fill("#00000000", outline=BURN, width=0.7, style="no")))
+
+    cells_name = {"collect": "Scouting cells", "observe": "Viewing cells",
+                  "forage": "Foraging cells"}[sp.mode]
     hot = add(project, gpkg_layer(gpkg, "hotspots"),
               f"{cells_name} (1 km² hex, {sp.short} %)")
     hot.setRenderer(graduated("species_pct", RAMP_CELLS, sp, cell_fill))

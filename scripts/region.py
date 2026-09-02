@@ -47,6 +47,47 @@ class Region:
             {"Wilderness", "National Monument", "National Recreation Area"}
         )
     )
+    # --- habitat conditions (scripts/habitat.py) ------------------------------
+    # Both of these are national services rather than state-office ones, so they are the
+    # same URL for every region and are narrowed by the county envelope at fetch time.
+    # They are still Region fields because the *filters* are not universal: which fcode
+    # counts as perennial water is a judgement about the state's hydrology.
+    # WFIGS rather than the InterAgencyFirePerimeterHistory view, which is the
+    # *finalised* archive and lags badly - it holds 104 Utah perimeters for 2019 and one
+    # for 2022. A burn condition asks about the last one to three seasons, so a source
+    # six years behind cannot answer it at all. WFIGS runs 2020 to the current fire year.
+    fire_perims: str = (
+        "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
+        "WFIGS_Interagency_Perimeters/FeatureServer/0"
+    )
+    # Wildfires only. Prescribed burns are in the same layer (9 of 1,385 over Utah) and
+    # are deliberately cool and patchy - they are not the stand-replacing event a
+    # fire-following fungus responds to.
+    fire_where: str = "attr_IncidentTypeCategory = 'WF'"
+    # Epoch milliseconds, even through the GeoJSON endpoint. Discovery rather than
+    # containment, because the season a fire started is the season the mycelium responds
+    # to, and a November fire's containment date lands in the wrong year.
+    fire_date_field: str = "attr_FireDiscoveryDateTime"
+    fire_name_field: str = "poly_IncidentName"
+    fire_acres_field: str = "poly_GISAcres"
+    # NHD large-scale flowlines and waterbodies. Field names on this service are
+    # lowercase, unlike every BLM layer here.
+    hydro_flowline: str = (
+        "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/6"
+    )
+    hydro_waterbody: str = (
+        "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12"
+    )
+    # 46006 is perennial stream/river. Intermittent (46003) is deliberately out: in Utah
+    # most mapped intermittent channels are dry washes, and buffering those would put
+    # "near water" over half the state and mean nothing.
+    flowline_where: str = "fcode=46006"
+    # Lake/pond (39004/39009-39012) and reservoir (43600 series). Playas and ice are not
+    # here for the same reason the washes are not.
+    waterbody_where: str = (
+        "fcode IN (39004,39009,39010,39011,39012,43600,43601,43613,43617,43618,"
+        "43619,43621,43624,43625,43626)"
+    )
 
 
 UTAH = Region(

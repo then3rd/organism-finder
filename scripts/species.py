@@ -1,4 +1,4 @@
-"""Which plant to screen for.
+"""Which taxon to screen for.
 
 Standard library only - stage 05 imports this too.
 
@@ -27,6 +27,15 @@ the two things a tree entry bundled together are now separate fields:
                    targets; "observe" drops the permit framing, keeps Wilderness and
                    national parks in scope rather than excluding them, and says plainly
                    that the plant is to be looked at. Orchids are observe.
+                   "forage" is the mushroom answer: picking a fruiting body leaves the
+                   organism in the ground, so it asks `Owner.forage` rather than
+                   `Owner.collect` and keeps Wilderness the way observe does.
+
+Fungi add a fourth field, `conditions`, and it is what makes them screenable at all.
+Their cover layer names the *host* community rather than the organism - LANDFIRE has a
+class for Douglas-fir and none for the morels that come up under it - so the host stand
+selects the country and a scripts/habitat.py condition selects the year and the site. A
+burn window or a distance to water is not a refinement on that map; it is half of it.
 
 A `range_url` 404, an empty EVT match and a taxon key with no records in the region are
 all hard errors upstream - the failure mode this registry exists to prevent is a
@@ -34,11 +43,13 @@ plausible-looking empty map.
 """
 from dataclasses import dataclass
 
+import habitat
+
 ATLAS = "https://raw.githubusercontent.com/wpetry/USTreeAtlas/master/geojson"
 
 LITTLE, GBIF = "little", "gbif"
 EVT, OCCURRENCE = "evt", "occurrence"
-COLLECT, OBSERVE = "collect", "observe"
+COLLECT, OBSERVE, FORAGE = "collect", "observe", "forage"
 
 
 @dataclass(frozen=True)
@@ -57,11 +68,14 @@ class Taxon:
     # actually contains, because the answer differs sharply per plant.
     ground_truth_caveat: str = ""
 
-    # --- the three axes, defaulted so the fourteen tree entries below say nothing ---
+    # --- the four axes, defaulted so the fourteen tree entries below say nothing ---
     kind: str = "tree"
     range_source: str | None = LITTLE
     cover: str = EVT
     mode: str = COLLECT
+    # habitat.Condition records: what has to be true of the ground beyond the cover
+    # class. Empty for every plant here, and the whole screen for a fungus.
+    conditions: tuple = ()
 
     # --- occurrence screening -------------------------------------------------
     # GBIF taxon key: `https://api.gbif.org/v1/species/match?name=<binomial>`. Pinned as
@@ -85,6 +99,14 @@ class Taxon:
             raise ValueError(f"{self.slug}: Little's atlas maps trees only")
         if (self.range_source == GBIF or self.cover == OCCURRENCE) and not self.gbif_key:
             raise ValueError(f"{self.slug}: occurrence screening needs a gbif_key")
+        for c in self.conditions:
+            if c.kind not in habitat.KINDS:
+                raise ValueError(f"{self.slug}: unknown condition kind {c.kind!r}")
+        if self.kind == "fungus" and not self.conditions:
+            # An EVT class names the host stand, which is most of Utah's forest. Without
+            # a condition the map would be "here is where trees are" wearing a mushroom
+            # name, which is exactly the plausible-looking wrong answer this guards.
+            raise ValueError(f"{self.slug}: a fungus needs at least one condition")
 
     @property
     def range_url(self):
@@ -94,6 +116,13 @@ class Taxon:
     def needs_landfire(self):
         """Stage 02 is a no-op for a plant LANDFIRE cannot see."""
         return self.cover == EVT
+
+    @property
+    def condition_columns(self):
+        """`<kind>_pct` for each condition, in registry order. The layer columns and the
+        leading terms of the ranking are both built from this, so a taxon that carries no
+        conditions carries no extra columns either."""
+        return [c.column for c in self.conditions]
 
     def matches(self, evt_name):
         name = evt_name.lower()
@@ -468,6 +497,106 @@ TAXA = {t.slug: t for t in (
             "Natural Heritage Program rather than acting on them."
         ),
     ),
+    # --- fungi ----------------------------------------------------------------
+    # The cover class here names the *host stand*, not the organism, so `short` says so
+    # and `species_pct` reads as host-community cover throughout. What narrows a host
+    # stand to a place worth walking is the condition, which is why these are the only
+    # entries in the registry that carry one.
+    Taxon(
+        slug="morcelat",
+        binomial="Morchella elata group",
+        common_name="black morel",
+        short="conifer host",
+        kind="fungus",
+        range_source=None, cover=EVT, mode=FORAGE,
+        # The stand-replacing burn hosts: Douglas-fir, spruce-fir, lodgepole, ponderosa,
+        # and the aspen-conifer mix. "aspen-mixed conifer" rather than bare "aspen" on
+        # purpose - pure aspen belongs to morcescu below, and the two entries are only
+        # worth having separately if their host sets actually differ.
+        evt_include=(
+            "douglas-fir", "spruce-fir", "lodgepole", "ponderosa", "aspen-mixed conifer",
+        ),
+        conditions=(
+            habitat.Condition(
+                habitat.BURN,
+                seasons=(1, 3),
+                note=(
+                    "Black morels fruit in quantity in the first and second spring after "
+                    "a stand-replacing fire and are largely gone by the fourth, so the "
+                    "window is the screen rather than a preference, and it is why this "
+                    "taxon's map goes stale: next spring it selects a different set of "
+                    "fires, so re-run rather than reusing last year's waypoints"
+                ),
+            ),
+        ),
+        ground_truth_caveat=(
+            "The percentage is *host conifer cover*, not morel cover - LANDFIRE has a "
+            "class for Douglas-fir and none for anything that fruits under it. "
+            "*M. elata* is a field name for a group of a dozen or so western species "
+            "that are not separable without sequencing, and the burn morels among them "
+            "are the reason the window is narrow."
+        ),
+    ),
+    Taxon(
+        slug="morcescu",
+        binomial="Morchella esculenta group",
+        common_name="natural morel",
+        short="riparian host",
+        kind="fungus",
+        range_source=None, cover=EVT, mode=FORAGE,
+        # No EVT class present in Utah names cottonwood - the riparian classes are named
+        # for the landform - so the water condition is doing the work the missing class
+        # cannot, rather than merely refining a stand this layer already found.
+        evt_include=("riparian woodland", "aspen forest"),
+        conditions=(
+            habitat.Condition(
+                habitat.WATER,
+                metres=400,
+                note=(
+                    "Utah's non-burn morels come up in hardwood bottoms - cottonwood, "
+                    "box elder, old orchards - which sit on the floodplain rather than "
+                    "on the stream. 400 m reaches the terrace without reaching the "
+                    "sagebrush above it"
+                ),
+            ),
+        ),
+        ground_truth_caveat=(
+            "The percentage is *host woodland cover*, not morel cover. This entry and "
+            "`pleuostr` are screened on the same classes and the same buffer and are "
+            "separated by nothing this pipeline can see - read them as one map of "
+            "riparian hardwood, with two different reasons to walk it. Old homesteads "
+            "and orchards are among the best natural morel ground in the state and are "
+            "invisible to a vegetation model."
+        ),
+    ),
+    Taxon(
+        slug="pleuostr",
+        binomial="Pleurotus ostreatus group",
+        common_name="oyster mushroom",
+        short="hardwood host",
+        kind="fungus",
+        range_source=None, cover=EVT, mode=FORAGE,
+        evt_include=("riparian woodland", "aspen forest"),
+        conditions=(
+            habitat.Condition(
+                habitat.WATER,
+                metres=400,
+                note=(
+                    "Oysters fruit on dead and dying hardwood, which in Utah means "
+                    "cottonwood and box elder in the bottoms and aspen higher up. The "
+                    "buffer is standing in for the cottonwood class LANDFIRE does not "
+                    "have"
+                ),
+            ),
+        ),
+        ground_truth_caveat=(
+            "The percentage is *host woodland cover*, not oyster cover, and cover says "
+            "nothing about the dead wood this fungus actually needs - a healthy stand "
+            "scores the same as one full of blowdown. Fruits after rain from spring "
+            "through autumn rather than in a season, so timing here is weather, not "
+            "calendar."
+        ),
+    ),
 )}
 
 # Callers written when this was a tree-only
@@ -491,11 +620,22 @@ def resolve(argv=(), default=DEFAULT):
 
 
 if __name__ == "__main__":
+    import datetime
+
+    _year = datetime.date.today().year
     _how = {("little", "evt"): "Little x EVT", (None, "evt"): "EVT only",
             ("gbif", "occurrence"): "GBIF records"}
     for _t in TAXA.values():
         _d = " (default)" if _t.slug == DEFAULT else ""
         _s = "  sensitive" if _t.sensitive else ""
+        # For a fungus the EVT class is the host, so say so rather than letting the
+        # column read as though LANDFIRE maps mushrooms.
+        _method = _how.get((_t.range_source, _t.cover), "?")
+        if _t.kind == "fungus" and _t.cover == EVT:
+            _method = "EVT host"
         print(f"  {_t.slug:10} {_t.kind:<6} {_t.mode:<8} "
-              f"{_how.get((_t.range_source, _t.cover), '?'):<13} "
+              f"{_method:<13} "
               f"{_t.common_name:<28} {_t.binomial}{_d}{_s}")
+        for _c in _t.conditions:
+            _gate = "must be" if _c.required else "prefers"
+            print(f"  {'':10} {'':6} {'':8} {'':13} ... {_gate} {_c.label(_year)}")

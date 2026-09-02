@@ -5,15 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A five-stage GIS pipeline (not an application, not a library) that finds **public land** in Utah
-where a given plant actually grows, and names the agency and unit that administers each parcel.
+where a given plant or fungus actually grows, and names the agency and unit that administers each
+parcel.
 Output is a QGIS project plus CSV / Markdown / KML / GPX deliverables. There is no test suite
 and no linter config.
 
-Which plant is a run-time argument. Utah juniper (*Juniperus osteosperma*, slug `junioste`) is
-the default and the species the pipeline was built around. Twenty-three taxa are registered:
-fifteen trees, one shrub, and seven orchids.
+Which taxon is a run-time argument. Utah juniper (*Juniperus osteosperma*, slug `junioste`) is
+the default and the species the pipeline was built around. Twenty-six taxa are registered:
+fifteen trees, one shrub, seven orchids, and three fungi.
 
-Two things the pipeline used to assume and no longer does:
+Three things the pipeline used to assume and no longer does:
 
 * **that BLM was the only landowner.** The Utah SMA service publishes the whole surface-
   management picture — 11,687 polygons, of which BLM administers 2,171 and SITLA 4,316.
@@ -21,6 +22,9 @@ Two things the pipeline used to assume and no longer does:
 * **that the plant was a tree.** Little's atlas maps only trees and LANDFIRE EVT names only
   woody *communities*, so a herbaceous plant is invisible to both. Orchids are screened from
   GBIF occurrence records instead.
+* **that the cover layer described the organism.** A fungus's mycelium is in ground the cover
+  layer can name — the host stand — but whether it fruits there turns on a condition the cover
+  layer knows nothing about. `scripts/habitat.py` is the fourth axis and holds those.
 
 ## Commands
 
@@ -31,6 +35,7 @@ to `junioste`. The pipeline stages are strictly ordered — each reads what the 
 just setup                # uv venv + deps
 just species              # the taxon registry, and how each one is screened
 just owners               # the ownership registry: who administers what, and what may be taken
+just conditions           # the habitat-condition kinds, and gate vs score
 just evt-classes pinyon   # which LANDFIRE classes a keyword selects
 just fetch      [slug]    # 01 sources    -> data/raw/**        (cached; re-runs are free)
 just landfire   [slug]    # 02 EVT tiles  -> data/work/<slug>/class.vrt   (skipped for orchids)
@@ -63,12 +68,14 @@ idea and is why no single layer can be dropped:
 | range | is this the plant's country at all? | coarse; for juniper Little's map blankets most of Utah |
 | cover | does it grow on *this* ground? | says nothing about who owns it |
 
-`scripts/03_overlay.py` applies them in that order and records each narrowing step in a
-`funnel` list, written to `out/<slug>/funnel.csv` and rendered as the acreage table in
+A fourth row, **conditions**, sits between jurisdiction and cover for the taxa that carry them:
+it asks what *happened* here rather than what grows here, and for a fungus it is half the
+screen. `scripts/03_overlay.py` applies the layers in that order and records each narrowing
+step in a `funnel` list, written to `out/<slug>/funnel.csv` and rendered as the acreage table in
 `summary.md`.
 
 The **range** and **cover** rows are each satisfied by one of several sources, chosen per taxon
-in the registry — see "The three axes" below. The jurisdiction row is always the SMA layer.
+in the registry — see "The four axes" below. The jurisdiction row is always the SMA layer.
 
 Three spatial units come out of stage 03 and everything downstream keys off them:
 * **`candidates`** — eligible public parcels, one row per polygon, ranked by `species_acres`.
@@ -85,32 +92,42 @@ Three spatial units come out of stage 03 and everything downstream keys off them
   meaning is "nobody here can help you".
 
 All layers live in the single `out/<slug>/<slug>.gpkg` (`candidates`, `hotspots`,
-`other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `exclusions`,
-`field_offices`, `office_points`); stages 04 and 05 both read only from it. `species_range` and
+`other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `burns`,
+`water_buffer`, `exclusions`, `field_offices`, `office_points`); stages 04 and 05 both read only from it. `species_range` and
 `occurrences` are written only when the taxon has them. Cover columns are `species_pct` /
 `species_acres` — deliberately taxon-neutral, because which plant they describe is the slug in
 the path. `evidence` is one short string naming what said so: a LANDFIRE class name, or a
 record count.
 
-### The three axes: taxon, region, ownership
+### The four axes: taxon, region, ownership, habitat
 
-Four small modules hold everything that varies, and **all four are standard-library only** —
+Five small modules hold everything that varies, and **all five are standard-library only** —
 stage 05 imports them under the system interpreter, where geopandas does not exist. Do not add
-a third-party import to `paths.py`, `species.py`, `region.py` or `ownership.py`.
+a third-party import to `paths.py`, `species.py`, `region.py`, `ownership.py` or `habitat.py`.
 
 * `scripts/species.py` — the taxon registry. Each `Taxon` carries `range_source`
   (`"little"` / `"gbif"` / `None`), `cover` (`"evt"` / `"occurrence"`), `mode`
-  (`"collect"` / `"observe"`), the EVT keywords or the GBIF taxon key, `sensitive`, and
+  (`"collect"` / `"observe"` / `"forage"`), `conditions` (a tuple of `habitat.Condition`),
+  the EVT keywords or the GBIF taxon key, `sensitive`, and
   `ground_truth_caveat` (per-taxon prose that lands in `summary.md`). `Species` is an alias
   for `Taxon` and `SPECIES` for `TAXA`; both names refer to the same objects.
-* `scripts/region.py` — jurisdiction service URLs, the working CRS, the county filter,
+* `scripts/region.py` — jurisdiction service URLs, the fire-perimeter and NHD services with
+  their filters, the working CRS, the county filter,
   `owner_field` (which SMA column names the administering agency), the GBIF state name, and
   `excluded_desig`. Only `UTAH` ships and region is not yet selectable at run time, but every
   state-specific fact lives here so adding a state is a data entry.
 * `scripts/ownership.py` — keyed by the SMA `ADMIN` code. Each `Owner` carries `public` (may
-  the public set foot on it), `collect` (`PERMIT` / `ASK` / `PROHIBITED`), the `authority`
-  prose that lands in `summary.md`, and the map colour. Unknown codes resolve to `UNKNOWN`,
+  the public set foot on it), `collect` (`PERMIT` / `ASK` / `PROHIBITED`), `forage` (the same
+  plus `FREE`), the `authority` and optional `forage_authority` prose that land in
+  `summary.md`, and the map colour. Unknown codes resolve to `UNKNOWN`,
   which is closed and grey — unchecked ground is treated as closed, never as open.
+* `scripts/habitat.py` — the habitat conditions. A `Condition` carries `kind` (`BURN` /
+  `WATER`), `required`, `seasons` (the burn window, in seasons back), `metres` (the water
+  buffer), and `note` prose for `summary.md`. `required=True` is a **gate**: ground failing it
+  is cut and a funnel row records it. `required=False` is a **score**: a `<kind>_pct` column
+  that leads `rank_order()` and nothing else. Both modes always produce the column, because a
+  parcel clipped to a burn perimeter is 100 % burned by construction but a *cell* straddling
+  the edge is not.
 * `scripts/paths.py` — every path. Nothing else builds one by concatenation. `out_dir()`
   returns `out/<slug>/` today and becomes `out/<region>/<slug>/` with no caller changes.
 
@@ -126,15 +143,26 @@ look at an orchid is exactly what a Wilderness is for, and subtracting national 
 orchid map would remove some of the best ground on it. `ownership.screenable(mode)` is the one
 function that decides this.
 
+`forage` is the third, and it exists because mushrooms are a different legal question rather
+than a softer one: picking a fruiting body leaves the organism in the ground, so BLM and USFS
+both allow personal-use quantities with **no permit at all** (`ownership.FREE`, a forage answer
+only) on ground where digging a tree needs paperwork. Reusing `collect` here would print the
+wrong law, so `Owner` carries a separate `forage` field and a `forage_authority` that falls back
+to `authority` where the two agree. `ownership.taking(mode)` names which field a mode consults;
+`observe` returns `None` and consults neither. Forage keeps Wilderness the way observe does —
+what is closed to a forager is closed by *administrator* (NPS, refuges) and `screenable` has
+already cut it.
+
 ### Adding a taxon
 
 The three axis fields are the whole judgement. Pick the row that matches:
 
-| the plant | `range_source` | `cover` | example |
+| the taxon | `range_source` | `cover` | example |
 |---|---|---|---|
 | a tree with a Little map and an EVT class | `LITTLE` | `EVT` | `junioste` |
 | a woody plant EVT names but Little never mapped | `None` | `EVT` | `artetrid` |
 | anything herbaceous | `GBIF` | `OCCURRENCE` | `platdila` |
+| a fungus (`kind="fungus"`, plus `conditions`) | `None` | `EVT` on the **host** | `morcelat` |
 
 `range_source=None` means "the region is the range" and is only honest for a plant that really
 does occupy the region broadly; do not reach for it to paper over a missing range map for a
@@ -149,6 +177,14 @@ share the juniper classes, `pinuedul`/`pinumono` the pinyon ones, and `piceenge`
 Spruce-Fir class — that last pair barely separates even on range, and its `ground_truth_caveat`
 says so. A 404 on the slug, an empty EVT match and a GBIF key with no records in the region are
 all hard errors — the failure this guards against is a plausible-looking empty map.
+
+A fungus entry uses no new axis combination — `(None, EVT)` is `artetrid`'s — and the whole
+difference is that its EVT classes name the *host stand*. `short` says so (`"conifer host"`),
+so the existing legend string reads `cell 25-40 % conifer host` and stays true, and
+`ground_truth_caveat` states in words that the percentage is host cover and the fungus may be
+in none of it. `__post_init__` refuses a `kind="fungus"` entry with no conditions: an EVT
+class alone is most of Utah's forest, and that map would be "here is where trees are" wearing
+a mushroom name — exactly the plausible-looking wrong answer this registry exists to prevent.
 
 `sensitive=True` is a **label only** — it adds a paragraph to `summary.md` and nothing else.
 It is set on the two slipper orchids and on *Spiranthes diluvialis*, which is federally listed.
@@ -224,7 +260,9 @@ The whole stage is a no-op for a taxon whose `cover` is not `EVT`.
   canyon. Round-robining over units rather than owners also stops one large agency taking every
   slot.
 * `scripts/05_qgis_project.py` — `RAMP_CELLS`, `RAMP_PARCELS`, `RAMP_OTHER`, `EXCLUDED`,
-  `RANGE`, `LAND_WASH_ALPHA`, and the per-agency colours in `ownership.py`.
+  `RANGE`, `BURN`, `LAND_WASH_ALPHA`, and the per-agency colours in `ownership.py`.
+* `scripts/habitat.py` — `Condition.seasons` and `Condition.metres` defaults; the per-taxon
+  values are in `species.py`.
 
 ### Cartography constraints (stage 05)
 
@@ -249,7 +287,12 @@ bottom vector layer at alpha 56, and agency identity is carried by the *opaque* 
 rather than by the translucent fill. So ownership may use green, brown and blue — hues the
 ramps avoid because at full alpha they collide with canopy, dirt and the cyan parcel ramp —
 without competing with any ramp step. Amber stays BLM's, which is the convention BLM's own
-land-status maps use. What is not negotiable is that the ramps keep magenta, cyan, red and
+land-status maps use. `BURN` (`#e65100`) is the one hue added since: it is affordable only because burn perimeters
+draw **outline-only at full alpha**, so a hard 0.7 mm orange line reads against BLM's amber
+*wash at alpha 56* rather than competing with it. The water buffer deliberately gets no hue at
+all — it is added and `hide()`d like `land_all`, because open water is already legible on the
+imagery and what the map must show is the buffer's consequence, which the surviving cells
+already encode. What is not negotiable is that the ramps keep magenta, cyan, red and
 violet to themselves; adding a ninth agency means finding a hue outside those four, not
 borrowing one. Colours live on the `Owner` records so the map and the tables cannot disagree.
 

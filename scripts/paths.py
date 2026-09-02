@@ -34,6 +34,16 @@ def occurrence_raw(species, region):
     return _mk(RAW / "occurrence") / f"{species.slug}_{region.key}.geojson"
 
 
+def fire_gpkg(region):
+    """Fire perimeter history, clipped to the region envelope at fetch time."""
+    return raw_dir(region) / "fire.gpkg"
+
+
+def water_gpkg(region):
+    """NHD perennial flowlines and waterbodies, ditto."""
+    return raw_dir(region) / "water.gpkg"
+
+
 def evt_csv():
     """The LANDFIRE EVT attribute table. One file for the whole country."""
     return _mk(RAW / "evt") / "LF23_EVT_240.csv"
@@ -43,6 +53,13 @@ def evt_csv():
 def evt_tile_dir(region):
     """Raw S16 EVT tiles, cached before the species remap so a second species is free."""
     return _mk(WORK / "evt" / region.key)
+
+
+def water_buffer_gpkg(region, metres):
+    """The dissolved water buffer. Region-scoped and taxon-free, like the raw EVT tiles:
+    buffering 65,000 NHD features and unioning them is minutes of work, and every taxon
+    asking for the same distance should pay for it once."""
+    return _mk(WORK / "water" / region.key) / f"buffer_{int(metres)}m.gpkg"
 
 
 def work_dir(species):

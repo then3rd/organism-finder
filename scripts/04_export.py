@@ -7,13 +7,17 @@ The map itself is <slug>.qgs - see scripts/05_qgis_project.py.
   out/<slug>/summary.md         per-owner rollup, framed by the taxon's mode
   out/<slug>/scouting.kml/.gpx  spatially spread waypoints for a phone GPS
 
-Two things vary with the taxon and nothing else does. `mode` decides whether this reads
-as a permit document or a place-to-go-look document; `sensitive` is carried through as a
-label on the output - the numbers themselves are the same numbers every other taxon gets.
+`mode` decides whether this reads as a permit document, a place-to-go-look document or a
+foraging one, and which of `Owner.collect` / `Owner.forage` the administrator table asks;
+`sensitive` is carried through as a label on the output, the numbers themselves being the
+same numbers every other taxon gets. Habitat conditions add their own columns, their own
+`note` prose and, for a burn, a hazard block - a recent burn is the one thing this
+pipeline points people at that can hurt them by being right.
 
     .venv/bin/python scripts/04_export.py [taxon-slug]
 """
 from pathlib import Path
+import datetime
 import sys
 import textwrap
 
@@ -24,6 +28,7 @@ import pandas as pd
 import simplekml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import habitat  # noqa: E402
 import ownership  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
@@ -39,10 +44,15 @@ def title(sp):
     return sp.common_name[:1].upper() + sp.common_name[1:]
 
 
+WHAT = {
+    "collect": "transplant permit screening",
+    "observe": "where to go and look",
+    "forage": "where to go and pick",
+}
+
+
 def heading(sp, reg):
-    what = ("transplant permit screening" if sp.mode == species_mod.COLLECT
-            else "where to go and look")
-    return f"# {title(sp)} on {reg.name} public land - {what}"
+    return f"# {title(sp)} on {reg.name} public land - {WHAT[sp.mode]}"
 
 
 def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
@@ -83,13 +93,22 @@ def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
 
 
 def owner_note(sp, codes):
-    """The per-owner authority paragraph. This is the part that changes with ownership."""
+    """The per-owner authority paragraph. This is the part that changes with ownership.
+
+    Which of the two taking fields is consulted is the mode's to decide, and the two give
+    different answers on the same ground: the Forest Service will not let you dig a tree
+    without paperwork and will let you fill a bag with morels without any.
+    """
+    field = ownership.taking(sp.mode) or "collect"
+    question = ("may mushrooms be taken?" if sp.mode == species_mod.FORAGE
+                else "may a plant be taken?")
     lines = ["", "## Who administers it, and what that means", "",
-             "| administrator | ground | may a plant be taken? |", "|---|---|---|"]
+             f"| administrator | ground | {question} |", "|---|---|---|"]
     for _, o in ownership.summarize(codes):
-        verb = {ownership.PERMIT: "yes, with a permit",
+        verb = {ownership.FREE: "yes, personal use, no permit",
+                ownership.PERMIT: "yes, with a permit",
                 ownership.ASK: "case by case - ask first",
-                ownership.PROHIBITED: "no"}[o.collect]
+                ownership.PROHIBITED: "no"}[getattr(o, field)]
         lines.append(f"| {o.name} ({o.short}) | {o.tenure} | {verb} |")
     lines.append("")
     if sp.mode == species_mod.OBSERVE:
@@ -100,27 +119,37 @@ def owner_note(sp, codes):
             "observe mode and nothing here is a suggestion to take one. See *Before you go*.",
             "",
         ]
+    if sp.mode == species_mod.FORAGE:
+        lines += [
+            "Personal-use limits and free-use permit rules are set forest by forest and",
+            "field office by field office, and they change from year to year. The bullets",
+            "below say who to ask; none of them is a substitute for asking.",
+            "",
+        ]
     for _, o in ownership.summarize(codes):
         lines.append(textwrap.fill(
-            f"* **{o.short}** - {o.authority}.",
+            f"* **{o.short}** - {ownership.authority_for(o, sp.mode)}.",
             width=90, subsequent_indent="  ",
             break_on_hyphens=False, break_long_words=False))
     return lines
 
 
 def tables(cand, hot, funnel, sp, reg, out):
+    year = datetime.date.today().year
     cols = ["rank", "owner", "owner_name", "managing_unit", "county", "DESIG", "in_lwc",
             "in_excluded", "land_acres", "species_acres", "species_pct", "evidence",
             "unit_url"]
+    cols += [c for c in sp.condition_columns + ["burn_year"] if c not in cols]
     c = cand[[x for x in cols if x in cand.columns]].copy()
     pts = cand.representative_point().to_crs(4326)
     c["lat"], c["lon"] = pts.y.round(5).to_numpy(), pts.x.round(5).to_numpy()
-    for col in ("land_acres", "species_acres", "species_pct"):
-        c[col] = c[col].round(1)
+    for col in ("land_acres", "species_acres", "species_pct", *sp.condition_columns):
+        if col in c.columns:
+            c[col] = c[col].round(1)
     c.to_csv(out / "candidates.csv", index=False)
 
     h = hot.drop(columns="geometry")
-    for col in ("cell_acres", "species_acres", "species_pct"):
+    for col in ("cell_acres", "species_acres", "species_pct", *sp.condition_columns):
         if col in h.columns:
             h[col] = h[col].round(1)
     h.to_csv(out / "hotspots.csv", index=False)
@@ -157,6 +186,17 @@ def tables(cand, hot, funnel, sp, reg, out):
             f"their own stated accuracy (at least {sp.occurrence_buffer_m} m). This is a "
             "record of where people have *looked and found*, not modelled cover",
     }.get((sp.range_source, sp.cover), "the sources named in scripts/species.py")
+
+    if sp.kind == "fungus":
+        # The EVT class names the host stand, and saying "where the fungus grows" here
+        # would be the one sentence in this document that is flatly untrue.
+        how = (f"**LANDFIRE EVT 30 m** for the *host* community - the stand this fungus "
+               f"fruits in, not the fungus, which no vegetation model maps")
+    if sp.conditions:
+        how += ", and " + " and ".join(
+            f"**{c.label(year)}**" if c.required else f"scored by *{c.label(year)}*"
+            for c in sp.conditions
+        )
 
     lines = [
         heading(sp, reg),
@@ -211,7 +251,8 @@ def tables(cand, hot, funnel, sp, reg, out):
             "point at a spot on the ground - work from `candidates.csv` and the administrator.",
         ]
     else:
-        verb = "to scout" if sp.mode == species_mod.COLLECT else "to go and look"
+        verb = {"collect": "to scout", "observe": "to go and look",
+                "forage": "to go and pick"}[sp.mode]
         lines += [
             "",
             f"## {len(picks)} place{'s' if len(picks) > 1 else ''} {verb}",
@@ -239,9 +280,28 @@ def tables(cand, hot, funnel, sp, reg, out):
 
 def caveats(sp, reg):
     """The closing section. Says what the screening does not model, in either mode."""
-    head = "## Before you dig" if sp.mode == species_mod.COLLECT else "## Before you go"
+    head = {"collect": "## Before you dig", "observe": "## Before you go",
+            "forage": "## Before you pick"}[sp.mode]
     lines = ["", head, ""]
-    if sp.mode == species_mod.COLLECT:
+    if sp.mode == species_mod.FORAGE:
+        lines += [
+            "* **This map finds habitat, not mushrooms, and it identifies nothing.** Every",
+            "  cell on it is a place the host stand and the conditions line up; whether",
+            "  anything is fruiting there this week is weather, and what you have picked is a",
+            "  question for a key and an expert, never for a map. *Gyromitra* comes up in the",
+            "  same burns as black morels and has killed people; *Omphalotus* grows on the",
+            "  same hardwood as oysters. Never eat a wild mushroom on the strength of where",
+            "  you found it.",
+            "* Personal use only. Every `free` in the table above means personal-use",
+            "  quantities - selling what you pick is a different permit on every agency here,",
+            "  and picking commercially without one is theft of public property.",
+            "* Wilderness, WSAs and monuments are *included* rather than subtracted: picking",
+            "  for the pot is lawful in them. What is closed to a forager is closed by",
+            "  administrator instead, and those owners are already out of this document.",
+            "* Cut or pinch, take what you will eat, and leave the duff and the dead wood",
+            "  the way you found them - the organism is the ground, not what you carried out.",
+        ]
+    elif sp.mode == species_mod.COLLECT:
         lines += [
             "* Call the administering unit first - and note that a permit from one agency is",
             "  worth nothing on another's ground, so check whose parcel you are actually on.",
@@ -261,6 +321,24 @@ def caveats(sp, reg):
             "* Stay on the trail where there is one, photograph rather than pick, and do not",
             "  clear vegetation for the shot.",
         ]
+    if any(c.kind == habitat.BURN for c in sp.conditions):
+        lines += [
+            "* **A recent burn is a hazard, not just habitat.** Standing dead trees come down",
+            "  without warning in wind, ash pits stay hot under a crust for months, and the",
+            "  road you can see on the imagery may have washed out in the first storm after",
+            "  the fire. Many burns are also under a BAER closure order for one to three",
+            "  seasons, which is exactly the window this map selects and which it does not",
+            "  model - check the administering unit's closures before you drive.",
+            "* The perimeter says a fire happened, not how hot it burned. This screening does",
+            "  not read burn severity, and it counts unburned islands inside a perimeter as",
+            "  burned, so treat a cell as a place to look rather than a place with morels.",
+        ]
+    for c in sp.conditions:
+        if c.note:
+            lines.append(textwrap.fill(
+                f"* **{c.label(datetime.date.today().year)}** - {c.note}.",
+                width=90, subsequent_indent="  ",
+                break_on_hyphens=False, break_long_words=False))
     if sp.sensitive:
         lines += [
             f"* **{title(sp)} is flagged sensitive.** It is listed, dug, or both, and the",
@@ -268,14 +346,20 @@ def caveats(sp, reg):
             "  Treat them accordingly: do not repost the waypoints, and do not lead anyone",
             "  to a patch you would not want dug.",
         ]
-    src = ("Little's range map is 1:2,000,000 (1971) and LANDFIRE EVT is 30 m *modelled* "
+    src = ("LANDFIRE EVT is 30 m *modelled* cover, and for a fungus it is describing the "
+           "host stand rather than the organism - the percentage on this map is host "
+           "cover, and the fungus may be in none of it."
+           if sp.kind == "fungus" else
+           "Little's range map is 1:2,000,000 (1971) and LANDFIRE EVT is 30 m *modelled* "
            "cover. Both are screening tools."
            if sp.cover == species_mod.EVT else
            "Occurrence records say where somebody looked and found, which is not where the "
            "plant is. These species are small, briefly visible and unevenly searched - "
            "absence of records is absence of records.")
     lines.append(textwrap.fill(
-        "* " + src + " Ground-truth the species before acting on this - "
+        "* " + src + " Ground-truth "
+        + ("this before acting on it - " if sp.kind == "fungus"
+           else "the species before acting on this - ")
         + sp.ground_truth_caveat,
         width=90, subsequent_indent="  ",
         break_on_hyphens=False, break_long_words=False))
@@ -295,7 +379,7 @@ def waypoints(hot, sp, out):
     if not len(picks):
         print("  -> no cells over threshold, skipping scouting.kml / scouting.gpx")
         return
-    what = "scouting" if sp.mode == species_mod.COLLECT else "viewing"
+    what = {"collect": "scouting", "observe": "viewing", "forage": "foraging"}[sp.mode]
     kml = simplekml.Kml(name=f"{title(sp)} {what} - {sp.binomial}")
     gpx = gpxpy.gpx.GPX()
     for _, r in picks.iterrows():

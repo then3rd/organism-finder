@@ -7,6 +7,10 @@ Three layers doing three different jobs:
                        the region is the range
   * cover            - does it grow on *this* ground? LANDFIRE EVT for a woody plant,
                        distance to a record for everything else
+  * conditions       - and is the ground itself right? A burn window, a distance to
+                       water. Empty for every plant; for a fungus it is half the screen,
+                       because its cover class names the host stand rather than the
+                       organism. See scripts/habitat.py.
 
 Ownership is a column, not a filter. Every administrator the SMA layer names is carried
 through to the GeoPackage so the map can show the whole public estate; what the taxon's
@@ -20,6 +24,7 @@ Writes out/<slug>/<slug>.gpkg.
     .venv/bin/python scripts/03_overlay.py [taxon-slug]
 """
 from pathlib import Path
+import datetime
 import sys
 import time
 
@@ -29,6 +34,7 @@ import pandas as pd
 from shapely.geometry import Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import habitat  # noqa: E402
 import ownership  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
@@ -213,13 +219,215 @@ def zonal_occurrence(gdf, occ, sp, label="occurrence"):
     )
 
 
+# --- conditions: and is the ground itself right ------------------------------
+# The cover pass asks what grows here. These ask what happened here, which for a fungus
+# is the half of the question its host class cannot answer. Masks are built once in
+# main() and then used two ways: a gate that cuts the ground before the expensive zonal
+# pass, and a score that only ranks.
+
+
+def fire_years(fire, reg):
+    """Fire year per perimeter, from the service's discovery timestamp.
+
+    WFIGS publishes epoch milliseconds even through the GeoJSON endpoint, so this is a
+    conversion rather than a read. Normalised once on load so everything downstream sees
+    a plain year and no other function has to know how this service spells a date.
+    """
+    raw = fire[reg.fire_date_field]
+    return pd.to_datetime(pd.to_numeric(raw, errors="coerce"), unit="ms").dt.year
+
+
+def burn_window(fire, cond, year):
+    """Perimeters whose fire year falls inside the condition's window.
+
+    The window is resolved against the calendar at run time rather than baked into the
+    download, so a cached perimeter file stays correct into next season instead of
+    quietly describing last year's fires.
+    """
+    lo, hi = year - cond.seasons[1], year - cond.seasons[0]
+    return fire[fire["fire_year"].between(lo, hi)].copy()
+
+
+def water_buffer(reg, cond):
+    """Perennial flowlines and waterbodies, buffered and dissolved.
+
+    Cached on disk per region and distance: 65,000 NHD features is minutes of buffering
+    and unioning, it is taxon-free, and morcescu and pleuostr ask for exactly the same
+    400 m. The same split that makes the raw EVT tile cache worth having.
+    """
+    cache = paths.water_buffer_gpkg(reg, cond.metres)
+    if cache.exists():
+        try:
+            return gpd.read_file(cache, layer="buffer").to_crs(reg.crs)
+        except Exception:
+            pass
+    t = Timer(f"buffering perennial water to {cond.metres} m")
+    src = paths.water_gpkg(reg)
+    parts = []
+    for layer in ("flowlines", "waterbodies"):
+        try:
+            g = gpd.read_file(src, layer=layer).to_crs(reg.crs)
+        except Exception:
+            continue
+        if len(g):
+            parts.append(g.geometry)
+    if not parts:
+        raise SystemExit(f"{src} has no water in it - re-run stage 01")
+    geoms = pd.concat(parts, ignore_index=True)
+    merged = gpd.GeoSeries(geoms, crs=reg.crs).buffer(cond.metres).union_all()
+    buf = gpd.GeoDataFrame(geometry=[merged], crs=reg.crs)
+    buf.to_file(cache, layer="buffer", driver="GPKG")
+    t.done(f"{len(geoms):,} features -> {acres(buf).sum():,.0f} acres")
+    return buf
+
+
+def condition_layers(sp, reg):
+    """`{kind: GeoDataFrame}` for every condition kind this taxon uses.
+
+    Read once and shared: morcescu asking for water twice would buffer it twice.
+    """
+    out = {}
+    for kind in habitat.kinds(sp.conditions):
+        if kind == habitat.BURN:
+            fire = gpd.read_file(paths.fire_gpkg(reg), layer="perimeters").to_crs(reg.crs)
+            fire["geometry"] = repair(fire.geometry)
+            fire["fire_year"] = fire_years(fire, reg)
+            fire["fire_name"] = fire[reg.fire_name_field]
+            fire["fire_acres"] = pd.to_numeric(fire[reg.fire_acres_field], errors="coerce")
+            out[kind] = fire[["fire_year", "fire_name", "fire_acres", "geometry"]]
+        elif kind == habitat.WATER:
+            out[kind] = water_buffer(reg, [c for c in sp.conditions
+                                           if c.kind == habitat.WATER][0])
+    return out
+
+
+def condition_mask(cond, layers, year, reg):
+    """The ground satisfying one condition, as a frame of parts.
+
+    Parts, not one merged geometry, and for the same reason `grid_over` takes frames: the
+    water buffer dissolves to a single polygon with millions of vertices, and every
+    `intersects` against it is an unindexed test over the whole thing. Kept as parts, the
+    spatial index turns the same work from tens of minutes into seconds.
+    """
+    if cond.kind == habitat.BURN:
+        sel = burn_window(layers[habitat.BURN], cond, year)
+        if not len(sel):
+            # An empty window is the setup being wrong - a window measured from the
+            # wrong year, or a region with no fire history - not an answer about the
+            # ground. Saying so here beats an empty map three stages later.
+            raise SystemExit(
+                f"no fire perimeters {cond.label(year)} - check the burn window in "
+                "scripts/species.py, or re-run stage 01 to refresh the perimeters"
+            )
+        parts = sel[["geometry"]]
+    else:
+        parts = layers[habitat.WATER][["geometry"]]
+    parts = parts.explode(index_parts=False).reset_index(drop=True)
+    return gpd.GeoDataFrame(parts, geometry="geometry", crs=reg.crs)
+
+
+def overlap_area(gdf, mask):
+    """Area of each feature that falls inside `mask`, indexed like `gdf`.
+
+    sjoin first so only the pairs that actually touch are intersected. Against a mask of
+    tens of thousands of parts this is the difference between an indexed lookup and a
+    full scan per feature.
+    """
+    out = pd.Series(0.0, index=gdf.index)
+    pairs = gpd.sjoin(gdf[["geometry"]], mask, how="inner", predicate="intersects")
+    if not len(pairs):
+        return out
+    left = gdf.geometry.loc[pairs.index].reset_index(drop=True)
+    right = mask.geometry.loc[pairs["index_right"].to_numpy()].reset_index(drop=True)
+    area = left.intersection(right, align=False).area
+    return out.add(area.groupby(pairs.index.to_numpy()).sum(), fill_value=0).loc[gdf.index]
+
+
+def clip_to(gdf, mask):
+    """`gdf` cut to `mask`, one row per input feature that survives.
+
+    `overlay` would return one row per (feature, mask part) pair - a parcel touching
+    forty buffered stream reaches would come back forty times - so the pieces are
+    dissolved back onto the feature they came from and the attributes ride along.
+    """
+    gdf = gdf.copy()
+    gdf["_gid"] = np.arange(len(gdf))
+    pieces = gpd.overlay(gdf, mask, how="intersection", keep_geom_type=True)
+    if not len(pieces):
+        return gdf.iloc[:0].drop(columns="_gid")
+    merged = pieces.dissolve(by="_gid")
+    out = gdf.drop(columns="geometry").set_index("_gid")
+    out = out.join(merged[["geometry"]], how="inner")
+    out = gpd.GeoDataFrame(out, geometry="geometry", crs=gdf.crs)
+    return out.reset_index(drop=True)
+
+
+def condition_scores(gdf, ctx):
+    """How much of each feature satisfies each condition, as `<kind>_pct` columns.
+
+    Reported for gated conditions too, not just scoring ones: a parcel clipped to a burn
+    perimeter is 100 % burned by construction, but a *cell* that straddles the edge is
+    not, and "just inside the perimeter" and "wholly inside it" are different places to
+    spend a morning.
+    """
+    sp = ctx["sp"]
+    out = pd.DataFrame(index=gdf.index)
+    if not sp.conditions:
+        return out
+    area = gdf.geometry.area.to_numpy()
+    for cond in sp.conditions:
+        inter = overlap_area(gdf, ctx["masks"][cond.kind]).to_numpy()
+        pct = np.divide(inter, area, out=np.zeros_like(inter), where=area > 0) * 100
+        out[cond.column] = np.clip(pct, 0, 100)
+    if habitat.BURN in ctx["masks"]:
+        # The year is what a forager actually plans around, so carry it rather than
+        # making them read it back out of the percentage.
+        out["burn_year"] = burn_years(gdf, ctx)
+    return out
+
+
+def burn_years(gdf, ctx):
+    """Most recent fire year overlapping each feature, NaN where none does."""
+    sel = ctx["burn_selection"]
+    if sel is None or not len(sel):
+        return np.full(len(gdf), np.nan)
+    reps = gpd.GeoDataFrame(
+        geometry=gdf.geometry.representative_point(), crs=gdf.crs, index=gdf.index
+    )
+    joined = gpd.sjoin(
+        reps, sel[["fire_year", "geometry"]], how="left", predicate="within"
+    )
+    years = pd.to_numeric(joined["fire_year"], errors="coerce")
+    return years.groupby(level=0).max().reindex(gdf.index).to_numpy()
+
+
+def apply_gates(cand, ctx, funnel, year):
+    """Cut the ground to the taxon's required conditions, one funnel row each.
+
+    Runs before the cover pass on purpose. A burn window over Utah removes something like
+    99 % of the candidate parcels, and the zonal pass is the slow half of this stage; the
+    order that reads as "narrow, then measure" is also the order that is fast.
+    """
+    for cond in habitat.gates(ctx["sp"].conditions):
+        cand = clip_to(cand, ctx["masks"][cond.kind])
+        funnel.append((f"... {cond.label(year)}", len(cand), acres(cand).sum()))
+        check(cand, funnel, f"nothing in range is {cond.label(year)}")
+    return cand
+
+
 def rank_order(sp):
     """A cell's cover fraction barely varies under occurrence scoring - a 1 km2 cell next
     to a record is simply inside the buffer - so record count has to lead, or the ranking
-    is a tie broken by area."""
+    is a tie broken by area.
+
+    Scoring conditions lead ahead of both. A taxon that merely prefers recent burns wants
+    the recent burns at the top; a gated one has already had the question answered
+    geometrically and adds nothing here.
+    """
+    lead = tuple(c.column for c in habitat.scores(sp.conditions))
     if sp.cover == species_mod.OCCURRENCE:
-        return ("samples", "species_pct", "species_acres")
-    return ("species_pct", "species_acres")
+        return lead + ("samples", "species_pct", "species_acres")
+    return lead + ("species_pct", "species_acres")
 
 
 def cover_scores(gdf, ctx, label):
@@ -315,11 +523,26 @@ def main():
         code_name.update(dict(zip(codes["code"], codes["evt_name"])))
     else:
         occ = gpd.read_file(paths.range_gpkg(sp), layer="occurrences").to_crs(reg.crs)
-    ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ}
+    ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ,
+           "masks": {}, "burn_selection": None}
+
+    year = datetime.date.today().year
+    if sp.conditions:
+        t = Timer("reading habitat conditions")
+        layers = condition_layers(sp, reg)
+        for cond in sp.conditions:
+            ctx["masks"][cond.kind] = condition_mask(cond, layers, year, reg)
+            if cond.kind == habitat.BURN:
+                ctx["burn_selection"] = burn_window(layers[habitat.BURN], cond, year)
+        t.done(", ".join(c.label(year) for c in sp.conditions))
 
     screenable = set(ownership.screenable(sp.mode))
     print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
     print(f"   mode={sp.mode}  range={sp.range_source or 'none'}  cover={sp.cover}")
+    if sp.conditions:
+        print("   conditions: " + ", ".join(
+            f"{'must be' if c.required else 'prefers'} {c.label(year)}"
+            for c in sp.conditions))
 
     # --- jurisdiction ---------------------------------------------------------
     t = Timer("reading the jurisdiction layers")
@@ -402,9 +625,13 @@ def main():
                        acres(cand).sum()))
         check(cand, funnel, "the legal exclusions cover everything in range")
     else:
+        # observe and forage both keep them. Walking into a Wilderness to look at an
+        # orchid is what a Wilderness is for, and picking mushrooms for the pot is
+        # lawful there too - what is closed to a forager is closed by owner (NPS,
+        # refuges) rather than by designation, and `screenable` has already cut that.
         cand = cand.explode(index_parts=False).reset_index(drop=True)
         cand["in_excluded"] = cand.intersects(excl_union)
-        print(f"  observe mode: keeping {int(cand['in_excluded'].sum()):,} parcels in "
+        print(f"  {sp.mode} mode: keeping {int(cand['in_excluded'].sum()):,} parcels in "
               "Wilderness / WSA / monument rather than subtracting them")
         # Not a narrowing step, but the explode above splits multipart parcels, so
         # without a row here the feature count jumps with nothing to explain it.
@@ -418,10 +645,21 @@ def main():
     cand["in_lwc"] = cand.intersects(lwc_union)
     t.done(f"{int(cand['in_lwc'].sum()):,} flagged")
 
+    # --- and is the ground itself right ---------------------------------------
+    # Before the cover pass, not after: this is the cheap filter and the zonal pass is
+    # the expensive one, so gating first is both the right reading order and the fast
+    # one. A plant carries no conditions and this is a no-op.
+    if habitat.gates(sp.conditions):
+        t = Timer("applying habitat conditions")
+        cand = apply_gates(cand, ctx, funnel, year)
+        t.done(f"{len(cand):,} parcels")
+
     # --- does it actually grow here -------------------------------------------
     cand = cand.reset_index(drop=True)
     stats = cover_scores(cand, ctx, f"scoring {len(cand):,} parcels for {sp.short}")
-    cand = pd.concat([cand.reset_index(drop=True), stats.reset_index(drop=True)], axis=1)
+    cond_stats = condition_scores(cand, ctx)
+    cand = pd.concat([cand.reset_index(drop=True), stats.reset_index(drop=True),
+                      cond_stats.reset_index(drop=True)], axis=1)
     cand = gpd.GeoDataFrame(cand, geometry="geometry", crs=reg.crs)
     cand["land_acres"] = acres(cand)
     cand["species_acres"] = cand["land_acres"] * cand["species_pct"] / 100
@@ -467,11 +705,14 @@ def main():
 
     cand = cand.sort_values("species_acres", ascending=False).reset_index(drop=True)
     cand["rank"] = np.arange(1, len(cand) + 1)
+    # Built rather than written out, so a taxon with no conditions carries no empty
+    # columns and one with two carries both.
+    cond_cols = [c for c in sp.condition_columns + ["burn_year"] if c in cand.columns]
     cand = cand[[
         "rank", "land_id", "owner", "owner_name", "tenure", "collect", "managing_unit",
         "unit_url", "county", "DESIG", "in_lwc", "in_excluded",
-        "land_acres", "species_acres", "species_pct", "evidence", "samples", "geometry",
-    ]]
+        "land_acres", "species_acres", "species_pct", "evidence", "samples",
+    ] + cond_cols + ["geometry"]]
 
     # --- scouting grid --------------------------------------------------------
     print("\n-- %g km2 hex scouting grid on screened public surface --" % HOTSPOT_KM2,
@@ -497,6 +738,10 @@ def main():
         rng.to_file(gpkg, layer="species_range", driver="GPKG")
     if occ is not None:
         occ.to_file(gpkg, layer="occurrences", driver="GPKG")
+    if ctx["burn_selection"] is not None and len(ctx["burn_selection"]):
+        ctx["burn_selection"].to_file(gpkg, layer="burns", driver="GPKG")
+    if habitat.WATER in ctx["masks"]:
+        ctx["masks"][habitat.WATER].to_file(gpkg, layer="water_buffer", driver="GPKG")
     exclusions.to_file(gpkg, layer="exclusions", driver="GPKG")
     admu.to_file(gpkg, layer="field_offices", driver="GPKG")
     gpd.read_file(raw / "admu.gpkg", layer="office").to_crs(reg.crs).to_file(
@@ -559,8 +804,13 @@ def grid_over(domain, ctx, reg, min_pct, subtract=None, min_acres=25):
         return grid
 
     stats = cover_scores(grid, ctx, f"scoring {len(grid):,} cells")
+    # Cells get the condition columns as well as the cover ones. A cell is a kilometre
+    # across and a burn edge runs through it, so "how much of this cell burned" is real
+    # information even where the parcel it sits on was clipped to the perimeter.
+    cond_stats = condition_scores(grid, ctx)
     grid = gpd.GeoDataFrame(
-        pd.concat([grid.reset_index(drop=True), stats.reset_index(drop=True)], axis=1),
+        pd.concat([grid.reset_index(drop=True), stats.reset_index(drop=True),
+                   cond_stats.reset_index(drop=True)], axis=1),
         geometry="geometry", crs=reg.crs,
     )
     grid["cell_acres"] = acres(grid)
@@ -597,6 +847,18 @@ HOTSPOT_COLS = [
 ]
 
 
+def with_conditions(cols, sp, grid):
+    """`cols` plus whichever condition columns this taxon produced, before the geometry.
+
+    The two column lists are constants because they are the layer contract; conditions
+    are per taxon, so they are spliced in rather than written into either list.
+    """
+    extra = [c for c in sp.condition_columns + ["burn_year"]
+             if c in grid.columns and c not in cols]
+    at = cols.index("geometry")
+    return cols[:at] + extra + cols[at:]
+
+
 def empty_cells(reg, cols):
     return gpd.GeoDataFrame(
         {c: [] for c in cols if c != "geometry"},
@@ -611,19 +873,27 @@ def build_hotspots(cand, ctx, reg):
         return empty_cells(reg, HOTSPOT_COLS)
     grid = attach(grid, cand, ["owner", "owner_name", "managing_unit", "county"])
     grid = rank_and_locate(grid, rank_order(ctx["sp"]))
-    return grid[HOTSPOT_COLS]
+    return grid[with_conditions(HOTSPOT_COLS, ctx["sp"], grid)]
 
 
 def build_other(screened, rng, counties, ctx, reg):
     """The same grid over the ground this screen cannot act on.
 
-    Domain is the region (narrowed by the range, when there is one) minus every screened
-    parcel. No managing unit is attached because there is nobody to ask: these cells say
-    where the plant is, not where you may go and get it.
+    Domain is the region (narrowed by the range and by any required condition, when
+    there are any) minus every screened parcel. No managing unit is attached because
+    there is nobody to ask: these cells say where the plant is, not where you may go and
+    get it.
+
+    The gates have to be applied here as well as to the candidates. The context grid
+    means "the same ground, off screenable surface"; without them it would silently widen
+    to the whole host stand and stop being a comparison at all.
     """
     domain = counties[["geometry"]]
     if rng is not None:
         domain = gpd.overlay(domain, rng[["geometry"]], how="intersection",
+                             keep_geom_type=True)
+    for cond in habitat.gates(ctx["sp"].conditions):
+        domain = gpd.overlay(domain, ctx["masks"][cond.kind], how="intersection",
                              keep_geom_type=True)
     if domain.empty:
         print("  the range does not reach this region")
@@ -634,7 +904,7 @@ def build_other(screened, rng, counties, ctx, reg):
         return empty_cells(reg, OTHER_COLS)
     grid = attach(grid, counties, ["county"])
     grid = rank_and_locate(grid, rank_order(ctx["sp"]))
-    return grid[OTHER_COLS]
+    return grid[with_conditions(OTHER_COLS, ctx["sp"], grid)]
 
 
 OTHER_COLS = [

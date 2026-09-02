@@ -1,16 +1,18 @@
-# Plants × Utah public land — where it grows, and who administers the ground
+# Plants and fungi × Utah public land — where it grows, and who administers the ground
 
-Finds **public land** in Utah where a given plant actually grows, and names the agency and
-unit that administers each parcel. Ships Utah juniper (*Juniperus osteosperma*) as the
-default, with twenty-two more taxa registered; adding another is a registry entry, not a
-code change.
+Finds **public land** in Utah where a given plant or fungus actually grows, and names the
+agency and unit that administers each parcel. Ships Utah juniper (*Juniperus osteosperma*)
+as the default, with twenty-five more taxa registered; adding another is a registry entry,
+not a code change.
 
 ```bash
-just species          # every registered plant, and how each one is screened
+just species          # every registered taxon, and how each one is screened
 just owners           # who administers ground here, and what may be taken off it
+just conditions       # what has to be true of the ground itself
 just all              # Utah juniper
 just all pinuedul     # two-needle pinyon
 just all platdila     # white bog orchid — a different screening method entirely
+just all morcelat     # black morel — host stand plus a burn window
 ```
 
 ## The three layers
@@ -32,17 +34,37 @@ genuinely woodland of the right type — but LANDFIRE class names are *community
 they cannot tell *J. osteosperma* from *J. scopulorum*, which is what the range polygon is
 still doing. And neither says anything about who issues a permit.
 
-## Two ways to screen a plant
+## Three ways to screen a taxon
 
 Little's atlas maps only trees, and LANDFIRE EVT names only woody *communities*. A
 herbaceous plant is invisible to both, so orchids are screened from georeferenced
 occurrence records instead — buffered by each record's own stated accuracy.
 
-| the plant | range | cover | example |
+| the taxon | range | cover | example |
 |---|---|---|---|
 | a tree with a Little map and an EVT class | Little 1971 | LANDFIRE EVT | `junioste` |
 | a woody plant EVT names but Little never mapped | none — the region is the range | LANDFIRE EVT | `artetrid` |
 | anything herbaceous | buffered GBIF records | the same records | `platdila` |
+| a fungus | none — the region is the range | EVT for the **host stand**, plus a condition | `morcelat` |
+
+A fungus is the case that needed a fourth axis. Its cover class names the tree it fruits
+under, not the organism — LANDFIRE has a class for Douglas-fir and none for the morels in
+it — so the host stand selects the country and a **condition** selects the year and the
+site. Two ship, in `scripts/habitat.py`:
+
+* **burn** — inside a fire perimeter one to three seasons old. Black morels flush in the
+  first springs after a stand-replacing fire and are largely gone by the fourth.
+* **water** — within 400 m of perennial stream or lake. No EVT class present in Utah names
+  cottonwood, so for the riparian taxa the buffer is doing the work the missing class
+  cannot, rather than merely refining a stand the cover layer already found.
+
+A condition is either a **gate** — ground failing it is cut, with its own funnel row — or a
+**score**, a `<kind>_pct` column that only ranks. All three fungi here gate. The gate runs
+before the cover pass, so it is also the fast order: a burn window takes Utah's 36 million
+screenable acres to 228 thousand before the expensive zonal pass sees any of it.
+
+Fire perimeters come from WFIGS rather than the finalised interagency history, which lags
+about six years and cannot answer a question about last season at all.
 
 Occurrence screening is a much weaker claim and the output says so: it records where
 somebody looked and found, not where the plant is. Absence of records is absence of
@@ -61,7 +83,7 @@ different shrub (*A. nova*, *A. arbuscula*) on different soils.
 A 404 on the slug, an empty EVT match and a GBIF key with no records in the region are all
 hard errors — the pipeline will not hand you a plausible-looking empty map.
 
-## Collect mode and observe mode
+## Collect, observe and forage mode
 
 Each taxon carries a `mode`, and it is what makes ownership do real work:
 
@@ -69,6 +91,13 @@ Each taxon carries a `mode`, and it is what makes ownership do real work:
   Wilderness, WSAs and monuments. Output is permit-oriented: who to apply to, and where.
 * **`observe`** — screens anything the public may stand on, and *keeps* those designations,
   flagging them instead. Output is a looking map.
+* **`forage`** — mushrooms, and a genuinely different legal question. Picking a fruiting
+  body leaves the organism in the ground, so agencies that will not let you dig a plant
+  will let you fill a bag with morels — the Forest Service and BLM both allow personal-use
+  quantities with no permit at all. It asks `Owner.forage` rather than `Owner.collect` and
+  keeps Wilderness the way observe does, because picking for the pot is lawful there. What
+  is closed to a forager is closed by *administrator* — national parks, refuges — which
+  `screenable()` has already removed.
 
 Every orchid here is observe mode, and not out of squeamishness: Utah's orchids depend on
 soil fungi that do not come up with the plant, so a transplanted one dies whatever the
@@ -97,6 +126,14 @@ Seven orchids, all observe mode: `calybulb` fairy slipper · `coramacu` spotted 
 `platdila` white bog orchid · `epipgiga` stream orchid · `goodoblo` western rattlesnake
 plantain · `cyprfasc` clustered lady's slipper · `spirdilu` Ute ladies'-tresses.
 
+Three fungi, all forage mode: `morcelat` black morel (conifer host × a 1–3 season burn
+window) · `morcescu` natural morel · `pleuostr` oyster mushroom (both riparian hardwood ×
+400 m of perennial water). The percentage on a fungus map is **host cover, not the
+fungus**, and `summary.md` says so in those words. It also says, at the top of *Before you
+pick*, that the map identifies nothing: *Gyromitra* comes up in the same burns as black
+morels, and a burn one to three seasons old — exactly the window this selects — is also
+where the snags, the ash pits and the BAER closure orders are.
+
 Some Utah plants are absent on purpose. No EVT class present in the state names cottonwood
 or white fir — the riparian classes are named for the landform — so there is nothing to
 screen a tree against, and a plant with no signal gets no entry rather than a misleading one.
@@ -111,7 +148,7 @@ Everything lands in `out/<slug>/`:
 
 | file | what |
 |---|---|
-| `<slug>.gpkg` | every layer: `candidates`, `hotspots`, `other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `exclusions`, `field_offices`, `office_points` |
+| `<slug>.gpkg` | every layer: `candidates`, `hotspots`, `other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `burns`, `water_buffer`, `exclusions`, `field_offices`, `office_points` |
 | `funnel.csv` | how the acreage narrows, step by step |
 | `summary.md` | per-agency and per-unit rollups, who to ask, and the caveats |
 | `candidates.csv` | one row per eligible public parcel |
@@ -125,7 +162,7 @@ than tracked.
 
 The palette exists to sit on top of aerial imagery. Adjacent ramp steps hold ΔE ≥ 20 in
 normal vision and ≥ 15.8 under simulated colour-vision deficiency. Magenta is the hex cells,
-cyan the parcels, red the context grid, violet the range; canopy green and dirt brown are
+cyan the parcels, red the context grid, violet the range, orange the burn perimeters; canopy green and dirt brown are
 avoided because they are the ground itself. Exclusions are a near-black hatch — they are
 identified by texture, so they can give red up to the context grid, which is far the larger
 area and vanished into snow and pale rock while it was grey. Red there is a tint over a
@@ -138,7 +175,9 @@ so the map and the tables cannot disagree.
 
 ## Knobs
 
-`MIN_SPECIES_ACRES`, `HOTSPOT_KM2`, `HOTSPOT_MIN_PCT` and `OTHER_MIN_ACRES` in
+Burn windows and water distances live on the `Condition` records in `scripts/habitat.py`,
+set per taxon in `scripts/species.py`. `MIN_SPECIES_ACRES`, `HOTSPOT_KM2`,
+`HOTSPOT_MIN_PCT` and `OTHER_MIN_ACRES` in
 `scripts/03_overlay.py`; `N_WAYPOINTS`, `N_TABLE` and `MIN_SEPARATION_M` in
 `scripts/04_export.py`. Jurisdiction, projection and legal exclusions live on the `Region`
 record in `scripts/region.py` — only Utah ships, but every state-specific fact is in that one
@@ -149,6 +188,9 @@ place. Who counts as public, and what may be taken off each agency's ground, liv
 
 This is a screening tool, not an authorization. It does not model ACEC boundaries, grazing or
 mineral leases, rights-of-way, sage-grouse habitat closures, developed recreation sites,
-riparian buffers, or cultural-resource restrictions. LANDFIRE EVT is *modelled* cover and its
-classes are communities rather than species. A permit from one agency is worth nothing on
-another's ground — check whose parcel you are actually standing on.
+riparian buffers, or cultural-resource restrictions. It does not model burn severity or
+post-fire closure orders. LANDFIRE EVT is *modelled* cover and its classes are communities
+rather than species — and for a fungus, a community it merely lives in. A permit from one
+agency is worth nothing on another's ground — check whose parcel you are actually standing
+on. Nothing here identifies a mushroom; a map cannot, and the ones that look like morels
+and oysters are the ones that put people in hospital.

@@ -38,10 +38,23 @@ def get(url, params=None, timeout=180, retries=4, stream=False):
     raise RuntimeError(f"GET failed after {retries} tries: {url} :: {last}")
 
 
-def esri_features(layer_url, where="1=1", out_fields="*", page=1000):
-    """Page an ArcGIS FeatureServer/MapServer layer into one GeoJSON FeatureCollection."""
+def esri_features(layer_url, where="1=1", out_fields="*", page=1000, bbox=None):
+    """Page an ArcGIS FeatureServer/MapServer layer into one GeoJSON FeatureCollection.
+
+    `bbox` is `(minx, miny, maxx, maxy)` in WGS84 and narrows the query server-side. The
+    state-office layers do not need it - they only hold one state - but the fire and
+    hydrography services are national, and downloading the country to keep Utah is not a
+    reasonable thing to do to somebody's connection.
+    """
     feats = []
     offset = 0
+    envelope = None
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        envelope = json.dumps({
+            "xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy,
+            "spatialReference": {"wkid": 4326},
+        })
     while True:
         params = {
             "where": where,
@@ -52,6 +65,13 @@ def esri_features(layer_url, where="1=1", out_fields="*", page=1000):
             "resultOffset": offset,
             "resultRecordCount": page,
         }
+        if envelope is not None:
+            params.update({
+                "geometry": envelope,
+                "geometryType": "esriGeometryEnvelope",
+                "inSR": 4326,
+                "spatialRel": "esriSpatialRelIntersects",
+            })
         data = get(f"{layer_url}/query", params=params).json()
         if "error" in data:
             raise RuntimeError(f"{layer_url}: {data['error']}")
@@ -69,11 +89,20 @@ def esri_features(layer_url, where="1=1", out_fields="*", page=1000):
     return {"type": "FeatureCollection", "features": feats}
 
 
-def esri_count(layer_url, where="1=1"):
-    return get(
-        f"{layer_url}/query",
-        params={"where": where, "returnCountOnly": "true", "f": "json"},
-    ).json()["count"]
+def esri_count(layer_url, where="1=1", bbox=None):
+    params = {"where": where, "returnCountOnly": "true", "f": "json"}
+    if bbox is not None:
+        minx, miny, maxx, maxy = bbox
+        params.update({
+            "geometry": json.dumps({
+                "xmin": minx, "ymin": miny, "xmax": maxx, "ymax": maxy,
+                "spatialReference": {"wkid": 4326},
+            }),
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+        })
+    return get(f"{layer_url}/query", params=params).json()["count"]
 
 
 def dump_json(obj, path):

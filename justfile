@@ -1,4 +1,4 @@
-# Tree species x BLM land - transplant permit screening
+# Plants and fungi x Utah public land - where it grows, and who administers the ground
 #
 # Every recipe takes a species slug from scripts/species.py; `just species` lists them.
 #   just all              # Utah juniper, the default
@@ -18,13 +18,17 @@ setup:
       geopandas rasterio exactextract simplekml gpxpy requests pyogrio
 
 # List the species this pipeline knows how to screen for.
-# every registered plant, with how each one is screened
+# every registered taxon, with how each one is screened
 species:
     @{{py}} scripts/species.py
 
 # who administers ground in this region, and what may be taken off it
 owners:
     @{{py}} scripts/ownership.py
+
+# what a habitat condition is, and how a gate differs from a score
+conditions:
+    @{{py}} scripts/habitat.py
 
 # Which LANDFIRE EVT classes a keyword selects - use before adding a species.
 evt-classes *keywords:

@@ -93,3 +93,42 @@ def gpkg_path(species):
 
 def qgs_path(species):
     return ROOT / f"{species.slug}.qgs"
+
+
+def grid_marker(species):
+    """Which lattice stage 03 laid: out/<slug>/grid.txt.
+
+    Stages 04 and 05 read the GeoPackage, which does not say what shape its cells are,
+    and re-running them must not have to repeat the argument stage 03 was given.
+    """
+    return out_dir(species) / "grid.txt"
+
+
+def about_gpkg(species):
+    """out/<slug>/about.gpkg - the one-feature fact sheet stage 05 regenerates each run.
+
+    Beside <slug>.gpkg rather than inside it: stage 03 owns that file, and a later stage
+    writing into an earlier stage's artifact inverts the one-way ordering everything else
+    here depends on.
+    """
+    return out_dir(species) / "about.gpkg"
+
+
+def notes_gpkg(species):
+    """out/<slug>/field_notes.gpkg - what the person carrying the phone wrote down.
+
+    The only file under out/ that this pipeline will not recreate, which is why it is a
+    file of its own: stage 03 rewrites <slug>.gpkg wholesale, so a notes layer inside it
+    would be destroyed by the next overlay run. Stage 05 creates this one only when it is
+    missing and never opens it for writing again.
+    """
+    return out_dir(species) / "field_notes.gpkg"
+
+
+def qfield_path(species):
+    """out/<slug>/<slug>_qfield.qgz - the portable project, beside the data it names.
+
+    Relative paths only work if the project ships with its data, so this one lives in the
+    directory you copy to the phone rather than at the repo root with the desktop map.
+    """
+    return out_dir(species) / f"{species.slug}_qfield.qgz"

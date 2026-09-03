@@ -5,3 +5,4 @@ out/
 __pycache__/
 *.qgs*
 *_attachments.zip
+symbology-style.db

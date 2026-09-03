@@ -3,6 +3,7 @@
 # Every recipe takes a species slug from scripts/species.py; `just species` lists them.
 #   just all              # Utah juniper, the default
 #   just all pinuedul     # two-needle pinyon
+#   just all junioste square  # the same screen, drawn on a square lattice
 
 py := ".venv/bin/python"
 # PyQGIS lives in system python, not the venv.
@@ -30,6 +31,10 @@ owners:
 conditions:
     @{{py}} scripts/habitat.py
 
+# the cell shapes the scouting grid can be cut from
+grids:
+    @{{py}} scripts/grid.py
+
 # Which LANDFIRE EVT classes a keyword selects - use before adding a species.
 evt-classes *keywords:
     @{{py}} scripts/evt_classes.py {{keywords}}
@@ -42,20 +47,26 @@ fetch sp="junioste":
 landfire sp="junioste":
     {{py}} scripts/02_landfire.py {{sp}}
 
-# The cross-reference -> out/<sp>/<sp>.gpkg.
-overlay sp="junioste":
-    {{py}} scripts/03_overlay.py {{sp}}
+# The cross-reference -> out/<sp>/<sp>.gpkg. `grid` is hex or square; `just grids` lists them.
+overlay sp="junioste" grid="hex":
+    {{py}} scripts/03_overlay.py {{sp}} {{grid}}
 
 # csv / md / kml / gpx -> out/<sp>/.
 export sp="junioste":
     {{py}} scripts/04_export.py {{sp}}
 
-# The QGIS project -> <sp>.qgs.
+# The QGIS project -> <sp>.qgs, and the portable copy -> out/<sp>/<sp>_qfield.qgz.
 qgis sp="junioste":
     {{qgis_py}} scripts/05_qgis_project.py {{sp}}
 
+# What to copy to the phone. Everything QField needs is in the one folder.
+qfield sp="junioste": (qgis sp)
+    @du -sh out/{{sp}}
+    @echo "copy out/{{sp}}/ to the phone, open {{sp}}_qfield.qgz in QField"
+    @echo "notes come back in out/{{sp}}/field_notes.gpkg - clean will not touch it"
+
 # Full pipeline, in order.
-all sp="junioste": (fetch sp) (landfire sp) (overlay sp) (export sp) (qgis sp)
+all sp="junioste" grid="hex": (fetch sp) (landfire sp) (overlay sp grid) (export sp) (qgis sp)
 
 # Every registered species, in registry order. Hours, not minutes.
 all-species:
@@ -76,7 +87,7 @@ qgis-all:
       just qgis "$sp"
     done
 
-# Open the map in QGIS.
+# Open the desktop map in QGIS.
 open sp="junioste": (qgis sp)
     qgis {{sp}}.qgs
 
@@ -84,12 +95,25 @@ open sp="junioste": (qgis sp)
 summary sp="junioste":
     @cat out/{{sp}}/summary.md
 
-# Delete generated outputs; keeps the data/ download cache.
+# Delete generated outputs; keeps the data/ download cache and the field notes.
 clean:
-    rm -rf out
-    rm -f *.qgs *.qgs~ *_attachments.zip
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # field_notes.gpkg and the photos beside it are the only things under out/ that a
+    # person made rather than this pipeline, and nothing can rebuild them. Dropping them
+    # is `just clean-notes <sp>`, deliberately and one taxon at a time.
+    if [ -d out ]; then
+      find out -mindepth 2 -depth \
+        ! -name field_notes.gpkg ! -name DCIM ! -path 'out/*/DCIM/*' -delete
+      find out -mindepth 1 -type d -empty -delete
+    fi
+    rm -f *.qgs *.qgs~ *_attachments.zip symbology-style.db
     find scripts -name __pycache__ -type d -exec rm -rf {} +
 
-# Delete outputs *and* the download cache - next run re-downloads everything.
+# Drop one taxon's field notes and photos. Nothing else deletes them.
+clean-notes sp="junioste":
+    rm -rf out/{{sp}}/field_notes.gpkg out/{{sp}}/DCIM
+
+# Delete outputs *and* the download cache - re-downloads everything; notes survive.
 clean-all: clean
     rm -rf data

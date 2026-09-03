@@ -21,7 +21,7 @@ on, so they stay in.
 
 Writes out/<slug>/<slug>.gpkg.
 
-    .venv/bin/python scripts/03_overlay.py [taxon-slug]
+    .venv/bin/python scripts/03_overlay.py [taxon-slug] [grid-shape]
 """
 from pathlib import Path
 import datetime
@@ -34,6 +34,7 @@ import pandas as pd
 from shapely.geometry import Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import grid as grid_mod  # noqa: E402
 import habitat  # noqa: E402
 import ownership  # noqa: E402
 import paths  # noqa: E402
@@ -43,7 +44,7 @@ from common import CRS_LF  # noqa: E402
 
 M2_PER_ACRE = 4046.8564224
 MIN_SPECIES_ACRES = 10      # drop slivers with essentially none of the plant on them
-HOTSPOT_KM2 = 1.0           # scouting cell area, km2 (flat-top hexagons)
+HOTSPOT_KM2 = 1.0           # scouting cell area, km2; scripts/grid.py tiles it
 HOTSPOT_MIN_PCT = 25.0      # a cell must be at least this much cover to be a hotspot
 ZONAL_CHUNK = 2000          # features per exact_extract call - see zonal_evt()
 OTHER_MIN_ACRES = 25        # same sliver floor as the public grid, applied off it
@@ -97,24 +98,6 @@ class Timer:
 
 def fmt(seconds):
     return f"{seconds:.0f}s" if seconds < 90 else f"{seconds / 60:.1f} min"
-
-
-def hex_cells(bounds, area_m2):
-    """Flat-top hexagons of the given area tiling `bounds`.
-
-    Hexes rather than squares so every neighbour is the same distance away and the lattice
-    has no dominant axis to read as an artifact over the terrain.
-    """
-    r = np.sqrt(2 * area_m2 / (3 * np.sqrt(3)))     # centre -> vertex
-    dx, dy = 1.5 * r, np.sqrt(3) * r                # column pitch, row pitch
-    corners = [(r * np.cos(a), r * np.sin(a)) for a in np.arange(6) * (np.pi / 3)]
-    xmin, ymin, xmax, ymax = bounds
-    cells = []
-    for i, cx in enumerate(np.arange(np.floor(xmin / dx) * dx - dx, xmax + dx, dx)):
-        offset = dy / 2 if i % 2 else 0.0
-        for cy in np.arange(np.floor(ymin / dy) * dy - dy, ymax + dy, dy):
-            cells.append(Polygon([(cx + ox, cy + offset + oy) for ox, oy in corners]))
-    return cells
 
 
 # --- cover: two ways of asking "does it grow here" ----------------------------
@@ -512,8 +495,12 @@ def load_range(sp, reg):
 def main():
     started = time.time()
     sp = species_mod.resolve(sys.argv)
+    shape = grid_mod.resolve(sys.argv)
     reg = region_mod.resolve()
     raw = paths.raw_dir(reg)
+    # Written before any of the work, so the stages that only read this run's output
+    # know what shape its cells are even on the paths that write no GeoPackage.
+    grid_mod.remember(paths.grid_marker(sp), shape)
     vrt = paths.vrt_path(sp)
 
     code_name = {0: "none"}
@@ -524,7 +511,7 @@ def main():
     else:
         occ = gpd.read_file(paths.range_gpkg(sp), layer="occurrences").to_crs(reg.crs)
     ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ,
-           "masks": {}, "burn_selection": None}
+           "grid": shape, "masks": {}, "burn_selection": None}
 
     year = datetime.date.today().year
     if sp.conditions:
@@ -538,7 +525,8 @@ def main():
 
     screenable = set(ownership.screenable(sp.mode))
     print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
-    print(f"   mode={sp.mode}  range={sp.range_source or 'none'}  cover={sp.cover}")
+    print(f"   mode={sp.mode}  range={sp.range_source or 'none'}  cover={sp.cover}"
+          f"  grid={shape.name}")
     if sp.conditions:
         print("   conditions: " + ", ".join(
             f"{'must be' if c.required else 'prefers'} {c.label(year)}"
@@ -715,8 +703,8 @@ def main():
     ] + cond_cols + ["geometry"]]
 
     # --- scouting grid --------------------------------------------------------
-    print("\n-- %g km2 hex scouting grid on screened public surface --" % HOTSPOT_KM2,
-          flush=True)
+    print("\n-- %g km2 %s scouting grid on screened public surface --"
+          % (HOTSPOT_KM2, ctx["grid"].label), flush=True)
     hotspots = build_hotspots(cand, ctx, reg)
 
     # The same grid over everything that is *not* screened public surface - private,
@@ -750,12 +738,13 @@ def main():
     t.done()
 
     funnel.append((
-        "hex cells (%g km2) >= %g%% %s" % (HOTSPOT_KM2, HOTSPOT_MIN_PCT, sp.short),
+        "%s cells (%g km2) >= %g%% %s"
+        % (ctx["grid"].label, HOTSPOT_KM2, HOTSPOT_MIN_PCT, sp.short),
         len(hotspots), hotspots["species_acres"].sum(),
     ))
     # below the rule: not a narrowing step, and not ground this screen can act on
     funnel.append((
-        "hex cells off screened surface (context only)",
+        "%s cells off screened surface (context only)" % ctx["grid"].label,
         len(other), other["species_acres"].sum(),
     ))
     write_funnel(sp, funnel)
@@ -764,7 +753,7 @@ def main():
 
 
 def grid_over(domain, ctx, reg, min_pct, subtract=None, min_acres=25):
-    """Hex-grid `domain`, score every cell for cover, keep the ones over `min_pct`.
+    """Grid `domain`, score every cell for cover, keep the ones over `min_pct`.
 
     Shared by the scouting grid and the context grid so the two are scored by exactly the
     same pass and can be compared cell for cell. `domain` and `subtract` are frames, not
@@ -773,8 +762,10 @@ def grid_over(domain, ctx, reg, min_pct, subtract=None, min_acres=25):
     pairwise tests against a shape with a million vertices, which is minutes, while the
     indexed pass is seconds.
     """
-    t = Timer("laying the hex lattice")
-    cells = hex_cells(domain.total_bounds, HOTSPOT_KM2 * 1e6)
+    shape = ctx["grid"]
+    t = Timer(f"laying the {shape.label} lattice")
+    cells = [Polygon(ring)
+             for ring in shape.tile(domain.total_bounds, HOTSPOT_KM2 * 1e6)]
     grid = gpd.GeoDataFrame({"cell": np.arange(len(cells))}, geometry=cells, crs=reg.crs)
     t.done(f"{len(cells):,} cells over the bounds")
 

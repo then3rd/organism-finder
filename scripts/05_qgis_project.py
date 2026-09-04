@@ -272,7 +272,7 @@ def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None)
     return sym
 
 
-def ownership_renderer(layer, field="owner"):
+def ownership_renderer(layer, reg, field="owner"):
     """One category per administering agency actually present in the layer.
 
     Driven off the data rather than off a fixed list: a region whose SMA layer names an
@@ -284,7 +284,7 @@ def ownership_renderer(layer, field="owner"):
         raise RuntimeError(f"{layer.name()}: no '{field}' field to categorise on")
     cats = []
     for code in sorted(layer.uniqueValues(idx), key=lambda c: str(c)):
-        o = ownership.owner(code)
+        o = ownership.owner(code, reg)
         sym = washed(o.color, LAND_WASH_ALPHA, o.color, width=0.3)
         access = "" if o.public else "  (closed)"
         cats.append(QgsRendererCategory(code, sym, f"{o.short} - {o.name}{access}"))
@@ -412,14 +412,14 @@ def owner_codes(gpkg):
     return sorted(cand.uniqueValues(idx), key=str) if idx >= 0 else []
 
 
-def funnel_text(sp):
+def funnel_text(sp, reg):
     """The acreage narrowing, read back from what stage 03 wrote.
 
     Read rather than recomputed: `MIN_SPECIES_ACRES`, `HOTSPOT_KM2` and `HOTSPOT_MIN_PCT`
     are stage 03's constants and this stage cannot import it, so any number here would be
     a third hand-copy of them. funnel.csv states them as they were actually applied.
     """
-    path = paths.out_dir(sp) / "funnel.csv"
+    path = paths.out_dir(sp, reg) / "funnel.csv"
     if not path.exists():
         return ""
     with path.open() as fh:
@@ -443,9 +443,9 @@ def about_values(sp, reg, grid_text, codes, when):
         "cover_source": factsheet.cover_text(sp),
         "conditions": factsheet.conditions_text(sp, when.year),
         "screen": factsheet.plain(factsheet.how(sp, year=when.year)),
-        "funnel": funnel_text(sp),
+        "funnel": funnel_text(sp, reg),
         "grid": grid_text,
-        "owners": factsheet.owner_plain(sp, codes),
+        "owners": factsheet.owner_plain(sp, reg, codes),
         "ground_truth": factsheet.plain(sp.ground_truth_caveat),
         "sensitive": ("yes - the coordinates here are full precision, like every other "
                       "taxon's. Do not repost them."
@@ -482,12 +482,12 @@ def write_about(sp, reg, gpkg, grid_text, when):
     for name, value in about_values(sp, reg, grid_text, owner_codes(gpkg), when).items():
         feat.setAttribute(name, value)
     mem.dataProvider().addFeatures([feat])
-    write_layer(mem, paths.about_gpkg(sp), "about")
+    write_layer(mem, paths.about_gpkg(sp, reg), "about")
 
     # Re-opened from the file rather than added as it stands: a memory layer serialises
     # into the project as an empty `memory://` datasource, so the map would carry a fact
     # sheet with nothing in it.
-    about = gpkg_layer(paths.about_gpkg(sp), "about")
+    about = gpkg_layer(paths.about_gpkg(sp, reg), "about")
     for name, _, text, multiline in ABOUT_FIELDS:
         alias(about, name, text)
         widget(about, name, "TextEdit", {"IsMultiline": multiline, "UseHtml": False})
@@ -503,7 +503,7 @@ def ensure_notes(sp, reg):
     nothing can rebuild it. So: created when missing, opened otherwise, and never
     migrated - a schema change must not be able to eat observations.
     """
-    path = paths.notes_gpkg(sp)
+    path = paths.notes_gpkg(sp, reg)
     if not path.exists():
         flds = QgsFields()
         for name, qtype, _ in NOTES_FIELDS:
@@ -615,18 +615,18 @@ def portable(project, notes):
 
 def main():
     sp = species_mod.resolve(sys.argv)
-    reg = region_mod.resolve()
+    reg = region_mod.resolve(sys.argv)
     # Read back rather than taken as an argument: the map has to name the lattice stage
     # 03 actually cut, not one this invocation was told about.
-    shape = grid_mod.recall(paths.grid_marker(sp))
-    gpkg = paths.gpkg_path(sp)
-    qgs_path = paths.qgs_path(sp)
+    shape = grid_mod.recall(paths.grid_marker(sp, reg))
+    gpkg = paths.gpkg_path(sp, reg)
+    qgs_path = paths.qgs_path(sp, reg)
     if not gpkg.exists():
         # Stage 03 writes funnel.csv either way, so its presence separates "screened, and
         # no public ground qualified" - which has no map to draw - from "never run".
-        if (paths.out_dir(sp) / "funnel.csv").exists():
+        if (paths.out_dir(sp, reg) / "funnel.csv").exists():
             print(f"{sp.common_name}: nothing qualified, no map to draw "
-                  f"(see out/{sp.slug}/summary.md)")
+                  f"(see {(paths.out_dir(sp, reg) / 'summary.md').relative_to(paths.ROOT)})")
             return
         raise SystemExit(f"{gpkg} not found - run stages 03 and 04 for {sp.slug} first")
 
@@ -675,7 +675,7 @@ def main():
                    "Every polygon the region's Surface Management Agency layer names, "
                    "private included. Off by default; switch it on to answer why a stand "
                    "stops where it does.")
-    all_land.setRenderer(ownership_renderer(all_land))
+    all_land.setRenderer(ownership_renderer(all_land, reg))
     hide(project, all_land)
 
     public = add(project, gpkg_layer(gpkg, "public_land"),
@@ -683,7 +683,7 @@ def main():
                  "Public surface, coloured by who administers it. A permit from one "
                  "agency is worth nothing on another's ground, so this layer answers the "
                  "question the parcel layer does not: whose ground are you on.")
-    public.setRenderer(ownership_renderer(public))
+    public.setRenderer(ownership_renderer(public, reg))
 
     # A taxon with no range filter has no range layer, and a taxon screened from records
     # has one that means something different, so the layer is named for what it is.
@@ -807,18 +807,18 @@ def main():
         "nothing in the pipeline rewrites.")
     notes.setRenderer(notes_renderer())
 
-    # --- desktop: the repo root, absolute paths, nothing locked ---------------
+    # --- desktop: absolute paths, nothing locked ------------------------------
     project.setFilePathStorage(Qgis.FilePathType.Absolute)
     project.write(str(qgs_path))
-    print(f"-> {qgs_path.name} with {len(project.mapLayers())} layers")
+    print(f"-> {qgs_path.relative_to(paths.ROOT)} with {len(project.mapLayers())} layers")
 
     # --- portable: beside its data, relative paths, read-only ----------------
     # Written second because every change `portable()` makes is one-directional and
     # nothing here undoes them.
     portable(project, notes)
-    qfield = paths.qfield_path(sp)
+    qfield = paths.qfield_path(sp, reg)
     project.write(str(qfield))
-    print(f"-> {qfield.relative_to(paths.ROOT)}  (copy out/{sp.slug}/ to the phone)")
+    print(f"-> {qfield.relative_to(paths.ROOT)}  (copy {paths.out_dir(sp, reg).relative_to(paths.ROOT)}/ to the phone)")
     qgs.exitQgis()
 
 

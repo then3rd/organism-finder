@@ -144,7 +144,7 @@ def conditions_text(sp, year=None):
     )
 
 
-def owner_note(sp, codes):
+def owner_note(sp, reg, codes):
     """The per-owner authority paragraph. This is the part that changes with ownership.
 
     Which of the two taking fields is consulted is the mode's to decide, and the two give
@@ -156,7 +156,7 @@ def owner_note(sp, codes):
                 else "may a plant be taken?")
     lines = ["", "## Who administers it, and what that means", "",
              f"| administrator | ground | {question} |", "|---|---|---|"]
-    for _, o in ownership.summarize(codes):
+    for _, o in ownership.summarize(codes, reg):
         verb = {ownership.FREE: "yes, personal use, no permit",
                 ownership.PERMIT: "yes, with a permit",
                 ownership.ASK: "case by case - ask first",
@@ -178,7 +178,7 @@ def owner_note(sp, codes):
             "below say who to ask; none of them is a substitute for asking.",
             "",
         ]
-    for _, o in ownership.summarize(codes):
+    for _, o in ownership.summarize(codes, reg):
         lines.append(textwrap.fill(
             f"* **{o.short}** - {ownership.authority_for(o, sp.mode)}.",
             width=90, subsequent_indent="  ",
@@ -186,7 +186,7 @@ def owner_note(sp, codes):
     return lines
 
 
-def owner_plain(sp, codes):
+def owner_plain(sp, reg, codes):
     """The same answers as one plain block: who administers it, and what may be taken."""
     field = ownership.taking(sp.mode) or "collect"
     verbs = {ownership.FREE: "personal use, no permit",
@@ -194,7 +194,7 @@ def owner_plain(sp, codes):
              ownership.ASK: "case by case - ask first",
              ownership.PROHIBITED: "no"}
     out = []
-    for _, o in ownership.summarize(codes):
+    for _, o in ownership.summarize(codes, reg):
         answer = ("" if sp.mode == species_mod.OBSERVE
                   else f" - taking: {verbs[getattr(o, field)]}")
         out.append(f"{o.short} ({o.name}, {o.tenure}){answer}")
@@ -236,7 +236,7 @@ def caveats(sp, reg):
         lines += [
             "* **This is a looking map, not a collecting map.** Every taxon screened in",
             "  observe mode is here because taking it is either unlawful, futile, or both -",
-            "  Utah's orchids depend on soil fungi that do not come up with the plant, so a",
+            "  these orchids depend on soil fungi that do not come up with the plant, so a",
             "  dug one dies whatever the paperwork says.",
             "* Wilderness, WSAs and national monuments are *included* here rather than",
             "  subtracted, because walking into them to look is exactly what they are for.",
@@ -286,8 +286,14 @@ def caveats(sp, reg):
         + sp.ground_truth_caveat,
         width=90, subsequent_indent="  ",
         break_on_hyphens=False, break_long_words=False))
+    # Only where the state office publishes the inventory. Idaho does not, so there is no
+    # `in_lwc` column to explain and claiming otherwise would describe a column that is
+    # not in the file.
+    if "lwc" in reg.nlcs:
+        lines.append(
+            "* Lands with wilderness characteristics (`in_lwc`) are not closed, but "
+            "expect scrutiny.")
     lines += [
-        "* Lands with wilderness characteristics (`in_lwc`) are not closed, but expect scrutiny.",
         "* The `other_cells` layer in the GeoPackage grids the same screen over ground this",
         "  document cannot act on - private, tribal, closed withdrawals, and any public owner",
         f"  this taxon's {sp.mode} mode rules out. It shows where the stands are and confers",
@@ -356,17 +362,18 @@ def abstract(sp, reg, grid=None, codes=(), samples=None, when=None):
     if grid:
         out.append(f"Scouting grid: {grid}")
     if codes:
-        out += ["", "Who administers it:", owner_plain(sp, codes)]
+        out += ["", "Who administers it:", owner_plain(sp, reg, codes)]
     out += ["", caveats_plain(sp, reg)]
     return "\n".join(out)
 
 
 if __name__ == "__main__":
+    import sys
     import region as region_mod
 
-    _reg = region_mod.resolve()
+    _reg = region_mod.resolve(sys.argv)
     for _slug in ("junioste", "platdila", "morcelat"):
         _sp = species_mod.resolve(["", _slug])
         print("=" * 78)
         print(abstract(_sp, _reg, grid="1 km2 hex",
-                       codes=list(ownership.screenable(_sp.mode))))
+                       codes=list(ownership.screenable(_sp.mode, _reg))))

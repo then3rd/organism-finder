@@ -79,10 +79,13 @@ def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
 def tables(cand, hot, funnel, sp, reg, out):
     year = datetime.date.today().year
     # Named rather than assumed: stage 03 chose the lattice and this stage only reports it.
-    shape = grid_mod.recall(paths.grid_marker(sp))
-    cols = ["rank", "owner", "owner_name", "managing_unit", "county", "DESIG", "in_lwc",
-            "in_excluded", "land_acres", "species_acres", "species_pct", "evidence",
-            "unit_url"]
+    shape = grid_mod.recall(paths.grid_marker(sp, reg))
+    # `reg.desig_field` rather than a literal: a region whose SMA layer names the column
+    # something else still exports it, and one that has no such column exports nothing.
+    # The comprehension below already drops whatever stage 03 did not write.
+    cols = ["rank", "owner", "owner_name", "managing_unit", "county", reg.desig_field,
+            "in_lwc", "in_excluded", "land_acres", "species_acres", "species_pct",
+            "evidence", "unit_url"]
     cols += [c for c in sp.condition_columns + ["burn_year"] if c not in cols]
     c = cand[[x for x in cols if x in cand.columns]].copy()
     pts = cand.representative_point().to_crs(4326)
@@ -143,7 +146,7 @@ def tables(cand, hot, funnel, sp, reg, out):
         lines.append(f"| {name} | {r['parcels']:,} | {r['land_acres']:,} | "
                      f"{r['species_acres']:,} |")
 
-    lines += factsheet.owner_note(sp, list(cand["owner"].unique()))
+    lines += factsheet.owner_note(sp, reg, list(cand["owner"].unique()))
 
     lines += [
         "",
@@ -273,9 +276,9 @@ def nothing_qualified(sp, reg, out):
 
 def main():
     sp = species_mod.resolve(sys.argv)
-    reg = region_mod.resolve()
-    out = paths.out_dir(sp)
-    gpkg = paths.gpkg_path(sp)
+    reg = region_mod.resolve(sys.argv)
+    out = paths.out_dir(sp, reg)
+    gpkg = paths.gpkg_path(sp, reg)
 
     if not gpkg.exists():
         return nothing_qualified(sp, reg, out)

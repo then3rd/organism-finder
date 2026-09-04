@@ -77,9 +77,28 @@ SHAPES = {s.name: s for s in (HEX, SQUARE)}
 DEFAULT = HEX.name
 
 
+def pick(argv, known, what):
+    """The one token of `argv[1:]` naming something in `known`, or None.
+
+    Scanned rather than read from a fixed index because three vocabularies share the
+    command line - taxon slugs, grid shapes, region keys - and only stage 03 takes all
+    three. A fixed index would make the region argv[3] there and argv[2] everywhere else,
+    which is a trap for anyone running a stage directly the way the docstrings advertise.
+    The vocabularies are disjoint by construction; naming two of the same kind is a typo
+    worth failing on rather than silently resolving.
+    """
+    found = [t for t in argv[1:] if t in known]
+    if len(found) > 1:
+        raise SystemExit(
+            f"two {what}s named: {', '.join(repr(f) for f in found)}\n"
+            f"known {what}s: {', '.join(known)}"
+        )
+    return found[0] if found else None
+
+
 def resolve(argv=(), default=DEFAULT):
-    """Lattice named by argv[2] - the optional second argument, after the taxon slug."""
-    name = argv[2] if len(argv) > 2 else default
+    """Lattice named anywhere in argv - `03_overlay.py junioste square id`."""
+    name = pick(argv, SHAPES, "grid shape") or default
     if name not in SHAPES:
         raise SystemExit(
             f"unknown grid shape {name!r}\nknown: {', '.join(SHAPES)}\n"

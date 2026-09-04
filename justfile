@@ -1,9 +1,15 @@
-# Plants and fungi x Utah public land - where it grows, and who administers the ground
+# Plants and fungi x public land - where it grows, and who administers the ground
 #
-# Every recipe takes a species slug from scripts/species.py; `just species` lists them.
-#   just all              # Utah juniper, the default
-#   just all pinuedul     # two-needle pinyon
-#   just all junioste square  # the same screen, drawn on a square lattice
+# Every recipe takes a species slug from scripts/species.py; `just species` lists them,
+# and a trailing region key; `just owners <key>` lists those. Region defaults to `ut`.
+#   just all                     # Utah juniper, in Utah
+#   just all pinuedul            # two-needle pinyon
+#   just all junioste square     # the same screen, drawn on a square lattice
+#   just all junioste hex id     # the same taxon, screened in Idaho
+#
+# Note the grid must be spelled when naming a region on `overlay` and `all`, because
+# they are positional: `just overlay junioste id` binds id to the grid slot and the
+# script fails loudly rather than quietly screening Utah.
 
 py := ".venv/bin/python"
 # PyQGIS lives in system python, not the venv.
@@ -24,8 +30,8 @@ species:
     @{{py}} scripts/species.py
 
 # who administers ground in this region, and what may be taken off it
-owners:
-    @{{py}} scripts/ownership.py
+owners reg="ut":
+    @{{py}} scripts/ownership.py {{reg}}
 
 # what a habitat condition is, and how a gate differs from a score
 conditions:
@@ -40,60 +46,64 @@ evt-classes *keywords:
     @{{py}} scripts/evt_classes.py {{keywords}}
 
 # Sources -> data/raw (cached).
-fetch sp="junioste":
-    {{py}} scripts/01_fetch.py {{sp}}
+fetch sp="junioste" reg="ut":
+    {{py}} scripts/01_fetch.py {{sp}} {{reg}}
 
-# EVT tiles -> data/work/<sp>/class.vrt.
-landfire sp="junioste":
-    {{py}} scripts/02_landfire.py {{sp}}
+# EVT tiles -> data/work/<reg>/<sp>/class.vrt.
+landfire sp="junioste" reg="ut":
+    {{py}} scripts/02_landfire.py {{sp}} {{reg}}
 
-# The cross-reference -> out/<sp>/<sp>.gpkg. `grid` is hex or square; `just grids` lists them.
-overlay sp="junioste" grid="hex":
-    {{py}} scripts/03_overlay.py {{sp}} {{grid}}
+# The cross-reference -> out/<reg>/<sp>/<sp>.gpkg. `grid` is hex or square; `just grids` lists them.
+overlay sp="junioste" grid="hex" reg="ut":
+    {{py}} scripts/03_overlay.py {{sp}} {{grid}} {{reg}}
 
-# csv / md / kml / gpx -> out/<sp>/.
-export sp="junioste":
-    {{py}} scripts/04_export.py {{sp}}
+# csv / md / kml / gpx -> out/<reg>/<sp>/.
+export sp="junioste" reg="ut":
+    {{py}} scripts/04_export.py {{sp}} {{reg}}
 
-# The QGIS project -> <sp>.qgs, and the portable copy -> out/<sp>/<sp>_qfield.qgz.
-qgis sp="junioste":
-    {{qgis_py}} scripts/05_qgis_project.py {{sp}}
+# The QGIS project -> out/<reg>/<sp>/<sp>.qgs, and the portable copy beside it
+# -> out/<reg>/<sp>/<sp>_qfield.qgz.
+qgis sp="junioste" reg="ut":
+    {{qgis_py}} scripts/05_qgis_project.py {{sp}} {{reg}}
 
 # What to copy to the phone. Everything QField needs is in the one folder.
-qfield sp="junioste": (qgis sp)
-    @du -sh out/{{sp}}
-    @echo "copy out/{{sp}}/ to the phone, open {{sp}}_qfield.qgz in QField"
-    @echo "notes come back in out/{{sp}}/field_notes.gpkg - clean will not touch it"
+qfield sp="junioste" reg="ut": (qgis sp reg)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$({{py}} scripts/paths.py dir {{sp}} {{reg}})
+    du -sh "$dir"
+    echo "copy $dir/ to the phone, open {{sp}}_qfield.qgz in QField"
+    echo "notes come back in $dir/field_notes.gpkg - clean will not touch it"
 
 # Full pipeline, in order.
-all sp="junioste" grid="hex": (fetch sp) (landfire sp) (overlay sp grid) (export sp) (qgis sp)
+all sp="junioste" grid="hex" reg="ut": (fetch sp reg) (landfire sp reg) (overlay sp grid reg) (export sp reg) (qgis sp reg)
 
 # Every registered species, in registry order. Hours, not minutes.
-all-species:
+all-species reg="ut":
     #!/usr/bin/env bash
     # Stage 03 is the long pole and runs once per tree. The EVT download is cached
     # region-wide, so only the first species ever pays for it.
     set -euo pipefail
     for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.TAXA))'); do
       echo "=========== $sp ==========="
-      just all "$sp"
+      just all "$sp" hex "{{reg}}"
     done
 
 # Every species' map, from the GeoPackages stage 03 already wrote - for styling changes.
-qgis-all:
+qgis-all reg="ut":
     #!/usr/bin/env bash
     set -euo pipefail
     for sp in $({{py}} -c 'import sys; sys.path.insert(0, "scripts"); import species; print(" ".join(species.TAXA))'); do
-      just qgis "$sp"
+      just qgis "$sp" "{{reg}}"
     done
 
 # Open the desktop map in QGIS.
-open sp="junioste": (qgis sp)
-    qgis {{sp}}.qgs
+open sp="junioste" reg="ut": (qgis sp reg)
+    qgis "$({{py}} scripts/paths.py qgs {{sp}} {{reg}})"
 
 # Print the acreage funnel and summary.
-summary sp="junioste":
-    @cat out/{{sp}}/summary.md
+summary sp="junioste" reg="ut":
+    @cat "$({{py}} scripts/paths.py summary {{sp}} {{reg}})"
 
 # Delete generated outputs; keeps the data/ download cache and the field notes.
 clean:
@@ -102,17 +112,26 @@ clean:
     # field_notes.gpkg and the photos beside it are the only things under out/ that a
     # person made rather than this pipeline, and nothing can rebuild them. Dropping them
     # is `just clean-notes <sp>`, deliberately and one taxon at a time.
+    # -mindepth 3 because the tree is out/<region>/<slug>/. It also means a pre-region
+    # out/<slug>/ layout sits at depth 2 and is left entirely alone, so running this
+    # before migrating cannot destroy notes that have not been moved yet.
     if [ -d out ]; then
-      find out -mindepth 2 -depth \
-        ! -name field_notes.gpkg ! -name DCIM ! -path 'out/*/DCIM/*' -delete
+      find out -mindepth 3 -depth \
+        ! -name field_notes.gpkg ! -name DCIM ! -path 'out/*/*/DCIM/*' -delete
       find out -mindepth 1 -type d -empty -delete
     fi
+    # symbology-style.db is QGIS's, written into whatever directory stage 05 ran from.
+    # The *.qgs sweep is for the old layout, when the projects lived at the repo root;
+    # they are under out/ now and the find above already took them.
     rm -f *.qgs *.qgs~ *_attachments.zip symbology-style.db
     find scripts -name __pycache__ -type d -exec rm -rf {} +
 
 # Drop one taxon's field notes and photos. Nothing else deletes them.
-clean-notes sp="junioste":
-    rm -rf out/{{sp}}/field_notes.gpkg out/{{sp}}/DCIM
+clean-notes sp="junioste" reg="ut":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$({{py}} scripts/paths.py dir {{sp}} {{reg}})
+    rm -rf "$dir/field_notes.gpkg" "$dir/DCIM"
 
 # Delete outputs *and* the download cache - re-downloads everything; notes survive.
 clean-all: clean

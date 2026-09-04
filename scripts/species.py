@@ -607,8 +607,24 @@ DEFAULT = "junioste"
 
 
 def resolve(argv=(), default=DEFAULT):
-    """Taxon named by argv[1], defaulting to the tree this pipeline started with."""
-    slug = argv[1] if len(argv) > 1 else default
+    """Taxon named in argv, defaulting to the tree this pipeline started with.
+
+    Grid and region tokens are removed first, and whatever is left must be a slug. The
+    lookup below stays strict on purpose: a mistyped slug has to be a hard error, because
+    the failure this registry exists to prevent is a plausible-looking empty map, and
+    `just all junioste idahoo` silently screening Utah would be exactly that.
+    """
+    import grid as grid_mod
+    import region as region_mod
+
+    rest = [t for t in argv[1:]
+            if t not in grid_mod.SHAPES and t not in region_mod.REGIONS]
+    if len(rest) > 1:
+        raise SystemExit(
+            f"two species named: {', '.join(repr(t) for t in rest)}\n"
+            "One taxon per run - `just all-species` loops over the whole registry."
+        )
+    slug = rest[0] if rest else default
     if slug not in SPECIES:
         raise SystemExit(
             f"unknown species {slug!r}\nknown: {', '.join(sorted(SPECIES))}\n"

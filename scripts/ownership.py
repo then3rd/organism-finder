@@ -7,10 +7,17 @@ originally screened one agency's land and encoded that agency in column names, l
 names and prose; the moment a second agency is in scope, "who administers this" has to
 become a value rather than an assumption.
 
-The Utah SMA service publishes an `ADMIN` code per polygon (`Region.owner_field`), and
-these records are keyed by it. Utah's codes are shared with the other BLM state-office
-SMA services, so most of this registry ports; `Region` names the field, this names the
-values.
+Each state-office SMA service publishes an agency code per polygon (`Region.owner_field`),
+and these records are keyed by it - so the registry is per region. That is not a
+generalisation for its own sake: Utah says `ADMIN` and Idaho says `MGMT_AGNCY`, and the
+values barely overlap either. Idaho's refuges are `NWR` where Utah's are `USFWS`, its
+Reclamation ground is `BOR` rather than `BR`, and it publishes `COE`, `LU_DOI` and
+`HSTRCWTR`, none of which Utah has. `Region` names the field; this names the values.
+
+The agencies themselves are mostly national, so the federal records are written once and
+recoded per region with `_as()`. A state that calls the Forest Service something else
+still gets the same sentence about ranger districts, which is the same argument
+scripts/factsheet.py makes about the map and the tables sharing prose.
 
 Two fields drive behaviour rather than display:
 
@@ -28,7 +35,7 @@ Two fields drive behaviour rather than display:
                 morels, several without any permit at all. Reusing `collect` here would
                 have the summary tell people the wrong law, so it is its own field.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # collect / forage: what may be taken off this ground
 FREE = "free"              # personal-use quantities, no permit required
@@ -63,8 +70,11 @@ class Owner:
     forage_authority: str = ""
 
 
-OWNERS = {o.code: o for o in (
-    # --- federal --------------------------------------------------------------
+# --- federal ------------------------------------------------------------------
+# National agencies, written once. Only the code differs between state offices, and
+# `_as()` below restamps it - the prose, the colour and the permit answers are the same
+# ground truth in every state.
+_FEDERAL = (
     Owner(
         code="BLM", name="Bureau of Land Management", short="BLM",
         tenure="federal", public=True, collect=PERMIT, forage=FREE, color="#ffb300",
@@ -104,7 +114,7 @@ OWNERS = {o.code: o for o in (
         forage_authority=(
             "Mushrooms are plants for the purpose of 36 CFR 2.1 and picking them is "
             "prohibited unless that unit's superintendent's compendium says otherwise, "
-            "which in Utah it generally does not"
+            "which few compendia in these states do"
         ),
     ),
     Owner(
@@ -144,9 +154,12 @@ OWNERS = {o.code: o for o in (
         authority="Federal ground held by an agency this registry does not name - identify "
                   "the administering agency before assuming anything",
     ),
-    # --- state ----------------------------------------------------------------
-    # SITLA is the big one in Utah - more polygons than BLM - and it is the owner most
-    # often mistaken for public land. It is a revenue trust, not a public estate.
+)
+
+# --- Utah state ---------------------------------------------------------------
+# SITLA is the big one in Utah - more polygons than BLM - and it is the owner most
+# often mistaken for public land. It is a revenue trust, not a public estate.
+_UTAH_STATE = (
     Owner(
         code="SITLA", name="School and Institutional Trust Lands Administration",
         short="SITLA", tenure="state", public=True, collect=PERMIT, forage=ASK,
@@ -200,7 +213,10 @@ OWNERS = {o.code: o for o in (
         tenure="state", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#37474f",
         authority="Highway right-of-way - not a place to park and dig",
     ),
-    # --- neither public nor private in the usual sense -------------------------
+)
+
+# --- neither public nor private in the usual sense ----------------------------
+_COMMON = (
     Owner(
         code="Tribal", name="tribal land", short="tribal",
         tenure="tribal", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#6a1b9a",
@@ -218,7 +234,156 @@ OWNERS = {o.code: o for o in (
         tenure="private", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#9e9e9e",
         authority="Private property - the landowner's permission is the only authority",
     ),
-)}
+)
+
+def _as(o, code):
+    """The same agency under the code this state's SMA layer publishes for it."""
+    return replace(o, code=code)
+
+
+def _by_code(owners, code):
+    return next(o for o in owners if o.code == code)
+
+
+# --- Idaho state and Idaho-only codes -----------------------------------------
+# IDL is the SITLA analogue - an endowment trust, not a public estate - but the two
+# states differ in a way worth keeping in the prose: Idaho endowment land is open to
+# public recreation by default, while taking anything off it still needs IDL's say-so.
+_IDAHO_STATE = (
+    Owner(
+        code="STATE", name="Idaho Department of Lands", short="IDL",
+        tenure="state", public=True, collect=PERMIT, forage=ASK, color="#1565c0",
+        authority=(
+            "State endowment land is managed to earn money for the beneficiaries, not "
+            "for recreation; IDL's area office issues the permit or lease, and taking "
+            "plants without one is trespass even though the ground is open to walk on"
+        ),
+        forage_authority=(
+            "Idaho endowment land is open to recreation, but gathering anything of "
+            "value is a separate conversation with the IDL area office"
+        ),
+    ),
+    Owner(
+        code="STATEFG", name="Idaho Department of Fish and Game", short="IDFG",
+        tenure="state", public=True, collect=ASK, forage=ASK, color="#1565c0",
+        authority=(
+            "Wildlife management areas are managed for habitat; ask the regional "
+            "office, and note that many WMAs are seasonally closed"
+        ),
+    ),
+    Owner(
+        # unverified: some Idaho parks do allow personal-use mushrooms under the park
+        # manager's discretion. Closed until somebody reads the current park rules -
+        # the cost of being wrong this way is a smaller map, the other way a citation.
+        code="STATEPR", name="Idaho Parks and Recreation", short="State Parks",
+        tenure="state", public=True, collect=PROHIBITED, forage=PROHIBITED,
+        color="#1565c0",
+        authority="Collecting plants in an Idaho state park is prohibited",
+        forage_authority=(
+            "Treated here as prohibited. Some Idaho parks permit personal-use "
+            "mushrooms at the manager's discretion - ring the park before assuming "
+            "either answer"
+        ),
+    ),
+)
+
+# Codes Idaho publishes that Utah has no equivalent for. The four marked unverified are
+# deliberately closed: the SMA layer names them but does not say enough to place them,
+# and "unchecked ground is treated as closed" is the rule the whole registry runs on.
+_IDAHO_ONLY = (
+    Owner(
+        code="COE", name="U.S. Army Corps of Engineers", short="USACE",
+        tenure="federal", public=True, collect=ASK, forage=ASK, color="#607d8b",
+        authority=(
+            "Corps project land around reservoirs is generally open to recreation, but "
+            "there is no standing plant-permit programme; ask the project office"
+        ),
+    ),
+    Owner(
+        code="BIA", name="tribal land", short="tribal",
+        tenure="tribal", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#6a1b9a",
+        authority=(
+            "Land held in trust for a tribe. It is not public land and this screening "
+            "confers nothing; entry and collection are the tribe's to grant"
+        ),
+    ),
+    Owner(
+        code="IR", name="tribal land", short="tribal",
+        tenure="tribal", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#6a1b9a",
+        authority=(
+            "Indian reservation. It is not public land and this screening confers "
+            "nothing; entry and collection are the tribe's to grant"
+        ),
+    ),
+    Owner(
+        # unverified
+        code="LU_USDA", name="land-utilization project (USDA)", short="LU tract",
+        tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#37474f",
+        authority=(
+            "A land-utilization tract whose administering agency this registry has not "
+            "identified - treat it as closed until somebody does"
+        ),
+    ),
+    Owner(
+        # unverified
+        code="LU_DOI", name="land-utilization project (DOI)", short="LU tract",
+        tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#37474f",
+        authority=(
+            "A land-utilization tract whose administering agency this registry has not "
+            "identified - treat it as closed until somebody does"
+        ),
+    ),
+    Owner(
+        # unverified
+        code="HSTRCWTR", name="historic water", short="hist. water",
+        tenure="state", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#37474f",
+        authority=(
+            "Bed of a historic or navigable watercourse. Even where the state holds it, "
+            "it is riverbed - not ground to send somebody to dig on"
+        ),
+    ),
+    Owner(
+        # unverified, and deliberately NOT mapped to Utah's `OF` ("other federal",
+        # public, ASK). Idaho's AGNCY_NAME for these rows is one of FAA, USDA, FHA, BIA,
+        # DOI or GSA - and BIA is tribal, so the permissive reading would open tribal
+        # ground on the strength of a code that means "we did not say".
+        code="OTHER", name="unnamed administrator", short="other",
+        tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED,
+        color="#9e9e9e",
+        authority=(
+            "The layer files this under a catch-all that spans several agencies, one of "
+            "them tribal - identify the administrator before assuming anything"
+        ),
+    ),
+)
+
+
+def _registry(*owners):
+    return {o.code: o for o in owners}
+
+
+UTAH_OWNERS = _registry(*_FEDERAL, *_UTAH_STATE, *_COMMON)
+IDAHO_OWNERS = _registry(
+    _by_code(_FEDERAL, "BLM"),
+    _by_code(_FEDERAL, "USFS"),
+    _by_code(_FEDERAL, "NPS"),
+    _as(_by_code(_FEDERAL, "USFWS"), "NWR"),
+    _as(_by_code(_FEDERAL, "BR"), "BOR"),
+    _as(_by_code(_FEDERAL, "DOD"), "MIL"),
+    _by_code(_FEDERAL, "DOE"),
+    *_IDAHO_ONLY,
+    *_IDAHO_STATE,
+    _as(_by_code(_COMMON, "Private"), "PRIVATE"),
+)
+
+# Deliberately no module-level `OWNERS`. A registry that resolves without naming a region
+# is how a caller silently gets Utah's answer on Idaho ground.
+REGISTRIES = {"ut": UTAH_OWNERS, "id": IDAHO_OWNERS}
 
 # Anything the service reports that is not in the registry. Unknown ground is treated as
 # closed rather than open: the failure mode to avoid is telling somebody to dig on ground
@@ -232,14 +397,52 @@ UNKNOWN = Owner(
 )
 
 
-def owner(code):
-    """Registry entry for an SMA ADMIN code, never KeyError."""
-    return OWNERS.get(code, UNKNOWN)
+def registry(reg):
+    """The owner records for a region. Accepts a `Region` or a bare key string.
+
+    Duck-typed rather than importing region.py, which keeps the module import graph a
+    DAG: region.py is a pure data record and nothing here needs to know that.
+    """
+    key = getattr(reg, "key", reg)
+    try:
+        return REGISTRIES[key]
+    except KeyError:
+        raise SystemExit(
+            f"no ownership registry for region {key!r}; known: "
+            f"{', '.join(sorted(REGISTRIES))}. A region needs one before it can be "
+            "screened - the SMA codes are the state office's, not a national set."
+        )
 
 
-def public_codes():
+def owner(code, reg):
+    """Registry entry for an SMA agency code, never KeyError."""
+    return registry(reg).get(code, UNKNOWN)
+
+
+def public_codes(reg):
     """Every code a member of the public can set foot on, in registry order."""
-    return [c for c, o in OWNERS.items() if o.public]
+    return [c for c, o in registry(reg).items() if o.public]
+
+
+# Most open to least. `stricter()` walks this, so the order is the rule.
+_TAKING_RANK = (FREE, PERMIT, ASK, PROHIBITED)
+
+
+def stricter(a, b):
+    """The more restrictive of two owner records.
+
+    For the regions whose SMA layer publishes a second agency column that can disagree
+    with the first (`Region.owner_confirm_field`). Closed beats open, and within open
+    ground the tighter taking answer wins. A polygon the layer cannot describe
+    consistently is not a polygon to send somebody to dig on.
+    """
+    if a.public != b.public:
+        return a if not a.public else b
+    for field_name in ("collect", "forage"):
+        ra, rb = (_TAKING_RANK.index(getattr(x, field_name)) for x in (a, b))
+        if ra != rb:
+            return a if ra > rb else b
+    return a
 
 
 def taking(mode):
@@ -251,8 +454,8 @@ def taking(mode):
     return {"collect": "collect", "forage": "forage"}.get(mode)
 
 
-def screenable(mode):
-    """Codes a taxon in this mode may be screened on.
+def screenable(mode, reg):
+    """Codes a taxon in this mode may be screened on, in this region.
 
     `collect` needs ground where a plant can lawfully leave; `forage` asks the same of
     mushrooms and gets a different and generally wider answer; `observe` only needs
@@ -261,9 +464,9 @@ def screenable(mode):
     """
     field = taking(mode)
     if field is None:
-        return public_codes()
+        return public_codes(reg)
     return [
-        c for c, o in OWNERS.items()
+        c for c, o in registry(reg).items()
         if o.public and getattr(o, field) in (FREE, PERMIT, ASK)
     ]
 
@@ -276,16 +479,16 @@ def authority_for(o, mode):
     return o.authority
 
 
-def summarize(codes):
+def summarize(codes, reg):
     """`[('BLM', Owner), ...]` for display, de-duplicated by owner name.
 
-    Two ADMIN codes can point at one agency - Utah publishes both `FFSL` and `SL&F` for
-    Forestry, Fire and State Lands - and a table with the agency twice is a bug report
-    waiting to happen.
+    Two agency codes can point at one agency - Utah publishes both `FFSL` and `SL&F` for
+    Forestry, Fire and State Lands, and Idaho both `BIA` and `IR` for tribal ground - and
+    a table with the agency twice is a bug report waiting to happen.
     """
     seen, out = set(), []
     for code in codes:
-        o = owner(code)
+        o = owner(code, reg)
         if o.name in seen:
             continue
         seen.add(o.name)
@@ -294,10 +497,24 @@ def summarize(codes):
 
 
 if __name__ == "__main__":
+    # region imported here rather than at module scope: stage 05 imports this file under
+    # the system interpreter and never runs this block, and keeping the import local is
+    # what stops the two data records depending on each other.
+    import sys
+    import region as region_mod
+
+    # The bare-key form, not the argv scan: this command's only argument *is* a region,
+    # so a typo has to be an error rather than a silent fall back to the default. Nothing
+    # else here would catch it - there is no species argument to reject the leftover.
+    _reg = region_mod.resolve(sys.argv[1] if len(sys.argv) > 1 else region_mod.DEFAULT)
+    print(f"\n  {_reg.name} - {len(registry(_reg))} administrators, keyed by "
+          f"{_reg.owner_field}\n")
     print(f"  {'code':<8} {'tenure':<8} {'entry':<7} {'plants':<10} {'mushrooms':<10} name")
-    for _c, _o in OWNERS.items():
+    for _c, _o in registry(_reg).items():
         _p = "public" if _o.public else "closed"
         print(f"  {_c:<8} {_o.tenure:<8} {_p:<7} {_o.collect:<10} "
               f"{_o.forage:<10} {_o.name}")
     print("\n  plants = collect mode, mushrooms = forage mode. `free` means personal-use")
     print("  quantities without a permit, and is a mushroom answer only.")
+    print(f"\n  Another region: `just owners <key>`; known: "
+          f"{', '.join(sorted(REGISTRIES))}.")

@@ -428,9 +428,9 @@ def report(funnel):
         print(f"  {label:<52} {n:>6}  {ac:>12,.0f} acres")
 
 
-def write_funnel(sp, funnel):
+def write_funnel(sp, reg, funnel):
     pd.DataFrame(funnel, columns=["stage", "features", "acres"]).to_csv(
-        paths.out_dir(sp) / "funnel.csv", index=False
+        paths.out_dir(sp, reg) / "funnel.csv", index=False
     )
 
 
@@ -469,7 +469,29 @@ def load_land(raw, reg):
     land["geometry"] = repair(land.geometry)
     land["land_id"] = np.arange(1, len(land) + 1)
     land["owner"] = codes.to_numpy()
-    owners = land["owner"].map(ownership.owner)
+    reg_owners = ownership.registry(reg)
+    owners = [reg_owners.get(c, ownership.UNKNOWN) for c in land["owner"]]
+
+    # Where the layer publishes a second agency column that can disagree with the first,
+    # the more restrictive answer wins. Idaho ships polygons reading MGMT_AGNCY='BLM'
+    # with AGNCY_NAME='PRIVATE'; on the first column alone that is a private inholding in
+    # the candidates table with a BLM field office to ring, which is the one error this
+    # whole registry exists to prevent.
+    if reg.owner_confirm_field and reg.owner_confirm_field in land.columns:
+        confirm = land[reg.owner_confirm_field].fillna("?")
+        downgraded = 0
+        merged = []
+        for o, c in zip(owners, confirm):
+            other = reg_owners.get(c, ownership.UNKNOWN)
+            winner = ownership.stricter(o, other)
+            downgraded += winner is not o
+            merged.append(winner)
+        owners = merged
+        if downgraded:
+            print(f"  {downgraded:,} polygons downgraded where {reg.owner_field} and "
+                  f"{reg.owner_confirm_field} disagree - the stricter reading wins")
+        land["owner"] = [o.code for o in owners]
+
     land["owner_name"] = [o.name for o in owners]
     land["tenure"] = [o.tenure for o in owners]
     land["public"] = [o.public for o in owners]
@@ -479,7 +501,7 @@ def load_land(raw, reg):
 
 def load_range(sp, reg):
     """The range polygon this taxon is filtered by, or None when it has no range filter."""
-    gpkg = paths.range_gpkg(sp)
+    gpkg = paths.range_gpkg(sp, reg)
     if sp.range_source == species_mod.LITTLE:
         return gpd.read_file(gpkg, layer="range").to_crs(reg.crs)
     if sp.range_source == species_mod.GBIF:
@@ -496,20 +518,20 @@ def main():
     started = time.time()
     sp = species_mod.resolve(sys.argv)
     shape = grid_mod.resolve(sys.argv)
-    reg = region_mod.resolve()
+    reg = region_mod.resolve(sys.argv)
     raw = paths.raw_dir(reg)
     # Written before any of the work, so the stages that only read this run's output
     # know what shape its cells are even on the paths that write no GeoPackage.
-    grid_mod.remember(paths.grid_marker(sp), shape)
-    vrt = paths.vrt_path(sp)
+    grid_mod.remember(paths.grid_marker(sp, reg), shape)
+    vrt = paths.vrt_path(sp, reg)
 
     code_name = {0: "none"}
     occ = None
     if sp.cover == species_mod.EVT:
-        codes = pd.read_csv(paths.codes_path(sp))
+        codes = pd.read_csv(paths.codes_path(sp, reg))
         code_name.update(dict(zip(codes["code"], codes["evt_name"])))
     else:
-        occ = gpd.read_file(paths.range_gpkg(sp), layer="occurrences").to_crs(reg.crs)
+        occ = gpd.read_file(paths.range_gpkg(sp, reg), layer="occurrences").to_crs(reg.crs)
     ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ,
            "grid": shape, "masks": {}, "burn_selection": None}
 
@@ -523,7 +545,7 @@ def main():
                 ctx["burn_selection"] = burn_window(layers[habitat.BURN], cond, year)
         t.done(", ".join(c.label(year) for c in sp.conditions))
 
-    screenable = set(ownership.screenable(sp.mode))
+    screenable = set(ownership.screenable(sp.mode, reg))
     print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
     print(f"   mode={sp.mode}  range={sp.range_source or 'none'}  cover={sp.cover}"
           f"  grid={shape.name}")
@@ -546,7 +568,7 @@ def main():
     cand = screened_land.copy()
     t.done(f"{len(land):,} SMA polygons, {len(public):,} public, {len(counties)} counties")
     print("  screening on: " + ", ".join(
-        f"{o.short}" for _, o in ownership.summarize(sorted(set(cand['owner'])))))
+        f"{o.short}" for _, o in ownership.summarize(sorted(set(cand['owner'])), reg)))
 
     funnel = [
         (f"{reg.name} surface management polygons", len(land), acres(land).sum()),
@@ -586,15 +608,20 @@ def main():
     # remove the best ground on the map for the wrong reason.
     t = Timer("reading Wilderness / WSA / NM-NCA")
     excl_parts = []
-    for layer in ("wilderness", "wsa", "nm_nca"):
+    for layer in [k for k in reg.nlcs_excluding if k in reg.nlcs]:
         g = gpd.read_file(raw / "nlcs.gpkg", layer=layer).to_crs(reg.crs)
         if len(g):
             g = g[["geometry"]].copy()
             g["excl_type"] = layer
             excl_parts.append(g)
-    desig_excl = land[land["DESIG"].isin(reg.excluded_desig)][["geometry"]].copy()
-    desig_excl["excl_type"] = "sma_designation"
-    excl_parts.append(desig_excl)
+    # Only where the SMA layer carries a designation column. Idaho's does not, so the
+    # NLCS polygons above are the whole answer there rather than a first opinion.
+    if reg.desig_field and reg.desig_field in land.columns:
+        desig_excl = land[land[reg.desig_field].isin(reg.excluded_desig)][["geometry"]].copy()
+        desig_excl["excl_type"] = "sma_designation"
+        excl_parts.append(desig_excl)
+    if not excl_parts:
+        excl_parts = [gpd.GeoDataFrame({"excl_type": []}, geometry=[], crs=reg.crs)]
     exclusions = gpd.GeoDataFrame(pd.concat(excl_parts, ignore_index=True), crs=reg.crs)
     exclusions["geometry"] = repair(exclusions.geometry)
     excl_union = exclusions.union_all()
@@ -626,12 +653,15 @@ def main():
         funnel.append(("... Wilderness / WSA / NM-NCA kept and flagged, parts split",
                        len(cand), acres(cand).sum()))
 
-    # lands with wilderness characteristics: a flag, not a bar, in either mode
-    t = Timer("flagging lands with wilderness characteristics")
-    lwc = gpd.read_file(raw / "nlcs.gpkg", layer="lwc").to_crs(reg.crs)
-    lwc_union = lwc.union_all()
-    cand["in_lwc"] = cand.intersects(lwc_union)
-    t.done(f"{int(cand['in_lwc'].sum()):,} flagged")
+    # lands with wilderness characteristics: a flag, not a bar, in either mode. Not every
+    # state office publishes the inventory - Idaho does not - and where it is missing no
+    # column is written at all rather than a column of False, which would assert we
+    # looked. Its absence from the deliverables is the honest form of "no data".
+    for layer in [k for k in reg.nlcs_flagging if k in reg.nlcs]:
+        t = Timer("flagging lands with wilderness characteristics")
+        flag = gpd.read_file(raw / "nlcs.gpkg", layer=layer).to_crs(reg.crs)
+        cand[f"in_{layer}"] = cand.intersects(flag.union_all())
+        t.done(f"{int(cand[f'in_{layer}'].sum()):,} flagged")
 
     # --- and is the ground itself right ---------------------------------------
     # Before the cover pass, not after: this is the cheap filter and the zonal pass is
@@ -660,7 +690,7 @@ def main():
     # answer about the ground rather than a fault in the setup. Stages 04 and 05 read the
     # missing GeoPackage as that same answer, so `just all` stays green.
     if not len(cand):
-        write_funnel(sp, funnel)
+        write_funnel(sp, reg, funnel)
         report(funnel)
         print(f"\nnothing qualifies: no {reg.name} public parcel carries "
               f"{MIN_SPECIES_ACRES} acres of mapped {sp.short}. The range overlaps "
@@ -679,13 +709,19 @@ def main():
     # Only BLM publishes a field-office layer, so only BLM parcels get a named unit. For
     # everyone else the honest answer is the agency plus what the SMA layer calls the
     # designation - "U.S. Forest Service / National Forest" - rather than a blank or, far
-    # worse, the BLM field office whose polygon happens to overlap it.
+    # worse, the BLM field office whose polygon happens to overlap it. Where the layer
+    # publishes no designation the suffix is simply dropped and the agency stands alone,
+    # which is all Idaho's SMA layer knows and so all it should be made to say.
     is_blm = cand["owner"].eq("BLM")
+    if reg.desig_field and reg.desig_field in cand.columns:
+        desig = cand[reg.desig_field]
+        suffix = np.where(desig.notna() & desig.ne("N/A"), " / " + desig.astype(str), "")
+    else:
+        suffix = ""
     cand["managing_unit"] = np.where(
         is_blm & cand["ADMU_NAME"].notna(),
         cand["ADMU_NAME"],
-        cand["owner_name"] + np.where(
-            cand["DESIG"].notna() & cand["DESIG"].ne("N/A"), " / " + cand["DESIG"], ""),
+        cand["owner_name"] + suffix,
     )
     cand["unit_url"] = cand["ADMU_ST_URL"].where(is_blm)
     cand = cand.drop(columns=["ADMU_NAME", "ADMU_ST_URL"])
@@ -696,9 +732,13 @@ def main():
     # Built rather than written out, so a taxon with no conditions carries no empty
     # columns and one with two carries both.
     cond_cols = [c for c in sp.condition_columns + ["burn_year"] if c in cand.columns]
+    # Same reasoning as cond_cols: a region whose SMA layer names no designation, or
+    # whose state office publishes no LWC inventory, carries neither column rather than
+    # carrying one full of nulls that would read as a finding.
+    opt_cols = [c for c in (reg.desig_field, "in_lwc") if c and c in cand.columns]
     cand = cand[[
         "rank", "land_id", "owner", "owner_name", "tenure", "collect", "managing_unit",
-        "unit_url", "county", "DESIG", "in_lwc", "in_excluded",
+        "unit_url", "county"] + opt_cols + ["in_excluded",
         "land_acres", "species_acres", "species_pct", "evidence", "samples",
     ] + cond_cols + ["geometry"]]
 
@@ -715,7 +755,7 @@ def main():
     print("\n-- the same grid off screened surface (context only) --", flush=True)
     other = build_other(screened_land, rng, counties, ctx, reg)
 
-    gpkg = paths.gpkg_path(sp)
+    gpkg = paths.gpkg_path(sp, reg)
     t = Timer(f"writing {gpkg.relative_to(paths.ROOT)}")
     cand.to_file(gpkg, layer="candidates", driver="GPKG")
     hotspots.to_file(gpkg, layer="hotspots", driver="GPKG")
@@ -747,7 +787,7 @@ def main():
         "%s cells off screened surface (context only)" % ctx["grid"].label,
         len(other), other["species_acres"].sum(),
     ))
-    write_funnel(sp, funnel)
+    write_funnel(sp, reg, funnel)
     report(funnel)
     print(f"\nstage 03 took {fmt(time.time() - started)}")
 

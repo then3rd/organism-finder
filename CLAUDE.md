@@ -4,15 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A five-stage GIS pipeline (not an application, not a library) that finds **public land** in Utah
-where a given plant or fungus actually grows, and names the agency and unit that administers each
-parcel.
+A five-stage GIS pipeline (not an application, not a library) that finds **public land** in a
+**region** where a given plant or fungus actually grows, and names the agency and unit that
+administers each parcel. Utah and Idaho ship; `ut` is the default.
 Output is a QGIS project plus CSV / Markdown / KML / GPX deliverables. There is no test suite
 and no linter config.
 
-Which taxon is a run-time argument. Utah juniper (*Juniperus osteosperma*, slug `junioste`) is
-the default and the species the pipeline was built around. Twenty-six taxa are registered:
-fifteen trees, one shrub, seven orchids, and three fungi.
+Which taxon *and which region* are run-time arguments. Utah juniper (*Juniperus osteosperma*,
+slug `junioste`) is the default and the species the pipeline was built around. Twenty-six taxa
+are registered: fifteen trees, one shrub, seven orchids, and three fungi.
+
+Both arguments are **positional and order-free** — `region.resolve()` and `grid.resolve()` scan
+argv for a token they recognise rather than reading a fixed index, because only stage 03 takes
+all three vocabularies and a fixed index would make the region `argv[3]` there and `argv[2]`
+everywhere else. The three vocabularies are disjoint by construction (slugs are eight
+characters, shapes are `hex`/`square`, region keys are two letters), and `species.resolve()`
+refuses whatever token is left over — so `just all junioste idahoo` fails with
+`unknown species 'idahoo'` rather than silently screening Utah.
 
 Three things the pipeline used to assume and no longer does:
 
@@ -34,21 +42,28 @@ to `junioste`. The pipeline stages are strictly ordered — each reads what the 
 ```
 just setup                # uv venv + deps
 just species              # the taxon registry, and how each one is screened
-just owners               # the ownership registry: who administers what, and what may be taken
+just owners      [reg]    # that region's ownership registry: who administers what
 just conditions           # the habitat-condition kinds, and gate vs score
 just grids                # the cell shapes the scouting grid can be cut from
 just evt-classes pinyon   # which LANDFIRE classes a keyword selects
-just fetch      [slug]    # 01 sources    -> data/raw/**        (cached; re-runs are free)
-just landfire   [slug]    # 02 EVT tiles  -> data/work/<slug>/class.vrt   (skipped for orchids)
-just overlay    [slug] [grid]   # 03 cross-ref -> out/<slug>/<slug>.gpkg + funnel.csv
-just export     [slug]    # 04 deliverables -> out/<slug>/*.csv, summary.md, scouting.kml/.gpx
-just qgis       [slug]    # 05 map        -> <slug>.qgs + out/<slug>/<slug>_qfield.qgz
-just qfield     [slug]    # what to copy to the phone (runs 05 first)
-just all        [slug] [grid]   # all five in order
-just clean                # drop out/ and the .qgs files, keep data/ *and the field notes*
-just clean-notes [slug]   # drop one taxon's field notes and photos - nothing else does
+just fetch      [slug] [reg]  # 01 sources -> data/raw/**       (cached; re-runs are free)
+just landfire   [slug] [reg]  # 02 EVT tiles -> data/work/<reg>/<slug>/class.vrt  (EVT taxa only)
+just overlay    [slug] [grid] [reg]  # 03 cross-ref -> out/<reg>/<slug>/<slug>.gpkg + funnel.csv
+just export     [slug] [reg]  # 04 deliverables -> out/<reg>/<slug>/*.csv, summary.md, kml/gpx
+just qgis       [slug] [reg]  # 05 map -> out/<reg>/<slug>/<slug>.qgs + <slug>_qfield.qgz
+just qfield     [slug] [reg]  # what to copy to the phone (runs 05 first)
+just all        [slug] [grid] [reg]  # all five in order
+just clean                # drop out/ (which now holds the .qgs files too), keep data/ *and the field notes*
+just clean-notes [slug] [reg]  # drop one taxon's field notes and photos - nothing else does
 just clean-all            # also drop data/ — forces a full re-download
 ```
+
+`reg` is the **last** positional on every recipe and defaults to `ut`, so every existing
+invocation keeps working. On `overlay` and `all` the grid sits between, and `just` binds
+positionally: `just all junioste hex id`, not `just all junioste id` — the latter puts `id` in
+the grid slot, and stage 03 then sees two region tokens and exits rather than screening Utah
+quietly. Both QGIS projects are written into `out/<reg>/<slug>/`, so neither filename has to
+encode the region — the directory already does.
 
 Scripts take one optional argument (the slug); every other setting is a module-level constant
 or a registry field. Note the two-interpreter split:
@@ -57,8 +72,9 @@ or a registry field. Note the two-interpreter split:
 * `05` **must** use `/usr/bin/python3` — PyQGIS is a system package and is not installed in
   the venv. It sets `QT_QPA_PLATFORM=offscreen` so it runs headless.
 
-`data/` and `out/` are gitignored, and so is `<slug>.qgs` at the repo root (`*.qgs*`) —
-the map is regenerated by `just qgis <slug>`, not tracked. The one exception in kind is
+`data/` and `out/` are gitignored, which now covers the QGIS projects too (`*.qgs*` stays in
+.gitignore for the old root-level layout) — the map is regenerated by `just qgis <slug>`, not
+tracked. The one exception in kind is
 `out/<slug>/field_notes.gpkg`: it is untracked like everything under `out/`, but nothing
 regenerates it, because a person wrote it. That is the right default — confirmed
 full-precision locations of a listed orchid are the most sensitive thing this repo can
@@ -129,15 +145,38 @@ a third-party import to `paths.py`, `species.py`, `region.py`, `ownership.py`, `
   `ground_truth_caveat` (per-taxon prose that lands in `summary.md`). `Species` is an alias
   for `Taxon` and `SPECIES` for `TAXA`; both names refer to the same objects.
 * `scripts/region.py` — jurisdiction service URLs, the fire-perimeter and NHD services with
-  their filters, the working CRS, the county filter,
-  `owner_field` (which SMA column names the administering agency), the GBIF state name, and
-  `excluded_desig`. Only `UTAH` ships and region is not yet selectable at run time, but every
-  state-specific fact lives here so adding a state is a data entry.
-* `scripts/ownership.py` — keyed by the SMA `ADMIN` code. Each `Owner` carries `public` (may
-  the public set foot on it), `collect` (`PERMIT` / `ASK` / `PROHIBITED`), `forage` (the same
-  plus `FREE`), the `authority` and optional `forage_authority` prose that land in
-  `summary.md`, and the map colour. Unknown codes resolve to `UNKNOWN`,
-  which is closed and grey — unchecked ground is treated as closed, never as open.
+  their filters, the working CRS, the county filter, `owner_field` (which SMA column names the
+  administering agency), the GBIF state name, and `excluded_desig`. `UTAH` and `IDAHO` ship and
+  the region is a run-time argument. Adding Idaho was *mostly* a data entry, and the ways it
+  was not are the interesting part — three fields exist because of them:
+  `owner_confirm_field` (a second agency column that can contradict the first),
+  `desig_field` (`None` where the state publishes no designation column), and
+  `nlcs_excluding` / `nlcs_flagging` (which NLCS layers bar collecting and which only flag,
+  skipping any the state does not publish). A field set to `None` is where a column
+  *disappears* from the deliverables rather than appearing full of nulls, because a null
+  column would assert we looked. `tenure_field` was removed: it was dead, and a dead field on
+  the record that doubles as the porting checklist sends the next person hunting for a column
+  that does not exist.
+* `scripts/ownership.py` — **per region**, keyed by that region's SMA agency code
+  (`REGISTRIES[key]`, reached through `registry(reg)`). Each `Owner` carries `public` (may the
+  public set foot on it), `collect` (`PERMIT` / `ASK` / `PROHIBITED`), `forage` (the same plus
+  `FREE`), the `authority` and optional `forage_authority` prose that land in `summary.md`, and
+  the map colour. Unknown codes resolve to `UNKNOWN`, which is closed and grey — unchecked
+  ground is treated as closed, never as open.
+
+  It is per region because the codes genuinely do not port: Utah's `ADMIN` and Idaho's
+  `MGMT_AGNCY` barely overlap (`USFWS` vs `NWR`, `BR` vs `BOR`, `DOD` vs `MIL`, and Idaho adds
+  `COE`, `LU_DOI`, `HSTRCWTR`). The *agencies* are national, so the federal records are written
+  once in `_FEDERAL` and recoded with `_as()`; only the code differs. There is deliberately no
+  module-level `OWNERS` — a registry that resolves without naming a region is how a caller
+  silently gets Utah's answer on Idaho ground. `owner()`, `public_codes()`, `screenable()` and
+  `summarize()` all take the region, and accept a `Region` or a bare key so this module never
+  imports `region.py`.
+
+  `stricter()` implements `owner_confirm_field`: where two columns name different owners the
+  more restrictive wins. Idaho ships one polygon reading `MGMT_AGNCY='BLM'` with
+  `AGNCY_NAME='PRIVATE'`, which on the first column alone is a private inholding in the
+  candidates table with a BLM field office to ring.
 * `scripts/habitat.py` — the habitat conditions. A `Condition` carries `kind` (`BURN` /
   `WATER`), `required`, `seasons` (the burn window, in seasons back), `metres` (the water
   buffer), and `note` prose for `summary.md`. `required=True` is a **gate**: ground failing it
@@ -159,8 +198,15 @@ a third-party import to `paths.py`, `species.py`, `region.py`, `ownership.py`, `
   drifted — a forage taxon's map was titled "where to go and look" over a summary that
   said "where to go and pick". Same argument as the colours living on `Owner`: one object,
   so the map and the tables cannot disagree.
-* `scripts/paths.py` — every path. Nothing else builds one by concatenation. `out_dir()`
-  returns `out/<slug>/` today and becomes `out/<region>/<slug>/` with no caller changes.
+* `scripts/paths.py` — every path. Nothing else builds one by concatenation, and
+  `python scripts/paths.py <what> <slug> <reg>` exists so the justfile can ask rather than
+  spell. `out_dir()` is `out/<region>/<slug>/` and `work_dir()` is `data/work/<region>/<slug>/`;
+  both took the region as a parameter and every caller did change, so the old note here
+  promising otherwise was wrong. `work_dir` matters as much as `out_dir` and less obviously:
+  its class tiles are keyed by a tile index over *that region's* county extent and
+  `class_tile()` returns early when the file exists, so a shared directory would have handed
+  Idaho Utah's rasters and drawn a perfectly good map of the wrong state. The raw EVT tiles
+  (`evt_tile_dir`) stay separate and taxon-free — that split is stage 02's whole point.
 
 Stages 03/04/05 contain no taxon logic at all — only registry lookups and dispatch on the
 axis fields.
@@ -246,11 +292,13 @@ method-agnostic. Two things about it are load-bearing:
 
 ### Two projects, one map
 
-Stage 05 writes the same map twice. `<slug>.qgs` at the repo root is the desktop project
-and keeps absolute datasources; `out/<slug>/<slug>_qfield.qgz` is the portable one, and
-its whole reason for existing is that a phone has no `/home/n3rd`. It sits *beside* the
-GeoPackages so path storage can be relative (`./<slug>.gpkg|layername=candidates`), which
-makes `out/<slug>/` the unit you copy.
+Stage 05 writes the same map twice, both into `out/<reg>/<slug>/`. `<slug>.qgs` is the
+desktop project and keeps absolute datasources, so its location is a filing decision rather
+than a functional one: QGIS writes the `.qgs~` backup and the `<name>_attachments.zip` next to
+the project file, and at the repo root that was 26 taxa of debris in the working tree.
+`<slug>_qfield.qgz` is the portable one, and *its* location is load-bearing — a phone has no
+`/home/n3rd`, so it has to sit beside the GeoPackages for path storage to be relative
+(`./<slug>.gpkg|layername=candidates`), which makes `out/<reg>/<slug>/` the unit you copy.
 
 Both come from one `QgsProject.instance()`: build the layers once, write the desktop file,
 mutate, write the portable one. Not two projects — `addMapLayer` takes ownership, so a
@@ -284,16 +332,22 @@ per CRS pair is the **whole** transformation, not just the datum shift — a bar
 Mediterranean.
 
 `region.py` pins the working CRS and `common.py` the LANDFIRE grid; code moves between them
-deliberately. `Region.crs = EPSG:26912` (NAD83 / UTM 12N) is the working projection — BLM Utah
-publishes in it and areas come out metric, so all acreage math must happen there.
+deliberately. `Region.crs` is the working projection — areas come out metric, so all acreage
+math must happen there. Utah is `EPSG:26912` (NAD83 / UTM 12N), which is what BLM Utah
+publishes in. Idaho is `EPSG:8826` (NAD83 / Idaho Transverse Mercator) rather than a UTM zone,
+because Idaho straddles 11N and 12N and a single zone would distort one end of the state; IDTM
+is the state standard and the SMA service's own native SR. Both resolve to one runnable
+datum operation at 4.0 m on this machine.
 `CRS_LF = EPSG:5070` is the LANDFIRE CONUS grid; `zonal_evt()` reprojects to it only for
 the `exact_extract` call. Lat/lon (4326) appears only at export time.
 
 ### Stage 02 detail
 
-Raw EVT over Utah is ~1 GB. `02_landfire.py` fetches 4096 px tiles and caches them **twice**:
-the raw S16 tile under `data/work/evt/<region>/`, then a `uint8` remap through the taxon LUT
-under `data/work/<slug>/` (0 = not this plant's community, 1..N = which one). The raw cache is
+Raw EVT over a state is ~1 GB. `02_landfire.py` fetches 4096 px tiles and caches them
+**twice**: the raw S16 tile under `data/work/evt/<region>/`, then a `uint8` remap through the
+taxon LUT under `data/work/<region>/<slug>/` (0 = not this plant's community, 1..N = which
+one). Both are keyed by tile index and both must be region-scoped, because tile 007 is
+different ground in a different state. The raw cache is
 region-scoped and taxon-free, so the first taxon pays the download and every later one is local
 work only — that split is the point, not an optimisation. `gdalbuildvrt` assembles the class
 tiles into `data/work/<slug>/class.vrt`; `evt_codes.csv` alongside it is the code → EVT name
@@ -371,12 +425,46 @@ is transparent in the middle so it rims parcels without hiding the cells beneath
 is in ground metres on purpose; a fixed screen width floods small parcels solid cyan when
 zoomed out. Ramp labels are format strings taking `{short}` from the registry.
 
+### What is not region-aware yet
+
+**The taxon registry is Utah-tuned, and adding Idaho did not change that.** Every
+`evt_include` keyword set was checked against the LANDFIRE classes present *in Utah*, and every
+`ground_truth_caveat` is Utah prose naming Utah places. Running a taxon against `id` screens
+Idaho ground with Utah's vegetation vocabulary and prints Utah's caveats. Nothing in the
+registry has been ecologically reviewed for Idaho.
+
+Where the error is contained, and where it is not:
+
+* A taxon with a Little range map is bounded by the range clip — `junioste` in Idaho comes out
+  as 136 parcels in Cassia, Bannock and Oneida counties, which is where Utah juniper actually
+  reaches, so the screen is doing its job.
+* A `range_source=None` taxon is the one to distrust first. "The region is the range" was
+  only ever validated for Utah, and for `artetrid` and the three fungi it is now an assertion
+  about a state nobody checked it against.
+* The EVT keywords are bare substrings matched against ecoregion-prefixed class names. They
+  will match a *different* set of classes in Idaho, and possibly the wrong ones.
+
+Treat an Idaho run as a plumbing demonstration until a taxon's keywords have been re-checked
+with `just evt-classes`. Also unvalidated for Idaho: `flowline_where` (perennial channels only,
+which is a judgement about Utah's hydrology — northern Idaho has more genuinely seasonal
+water), and five ownership entries marked `# unverified` in the registry (`STATEPR`,
+`LU_USDA`, `LU_DOI`, `HSTRCWTR`, `OTHER`), all of which are deliberately closed.
+
+`OTHER` is worth naming specifically. It is Idaho's catch-all, 531 polygons, and **523 of them
+carry `AGNCY_NAME='BIA'` — they are tribal land.** Mapping it to Utah's `OF` ("other federal",
+public, `ASK`) because the names look alike would have opened 523 tribal parcels to a
+collect-mode screen. It is closed instead, and that is the rule the registry runs on rather
+than a special case.
+
 ## Domain caveats worth preserving
 
 Results are a screening tool, not an authorization. The pipeline does not model ACECs, grazing
 or mineral leases, rights-of-way, sage-grouse habitat, developed recreation sites, riparian
 buffers, or cultural-resource restrictions. LANDFIRE EVT is *modelled* cover and its classes
-are communities rather than species. Occurrence records say where somebody looked and found,
+are communities rather than species. Not every state office publishes every layer: Idaho has no
+lands-with-wilderness-characteristics inventory and no wild & scenic river layer, so an Idaho
+run carries no `in_lwc` column at all. That is an absence of data, not a finding of absence,
+and the column is omitted rather than filled with `False` for exactly that reason. Occurrence records say where somebody looked and found,
 which is not where the plant is — absence of records is absence of records. A permit from one
 agency is worth nothing on another's ground, which is the main new way to get hurt now that
 several agencies appear on one map. The generated `summary.md` says all of this — keep it

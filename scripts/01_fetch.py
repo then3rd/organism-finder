@@ -37,11 +37,21 @@ def save(gdf, path, layer=None):
     print(f"  -> {path.name}:{layer or path.stem}  n={len(gdf)}  crs={gdf.crs.to_string()}")
 
 
-def fetch_layer(url, path, layer, crs, where="1=1", bbox=None):
+def fetch_layer(url, path, layer, crs, where="1=1", bbox=None, expect=None):
+    """One layer, downloaded or read from cache.
+
+    `expect` is the server's current feature count, and it is checked only on the paths
+    that actually download - it guards against *paging* dropping features mid-fetch. A
+    cached layer is deliberately not compared against it: these services are republished,
+    and Utah's SMA layer has gone from 11,687 polygons to 11,672 since this cache was
+    written. That is upstream drift, not a lost page, and it is `just clean-all`'s job to
+    pick it up rather than a reason to refuse to run.
+    """
     if path.exists():
         try:
             existing = gpd.read_file(path, layer=layer)
-            print(f"  cached {path.name}:{layer} n={len(existing)}")
+            drift = "" if expect in (None, len(existing)) else f" (server now {expect})"
+            print(f"  cached {path.name}:{layer} n={len(existing)}{drift}")
             return existing
         except Exception:
             pass
@@ -53,6 +63,7 @@ def fetch_layer(url, path, layer, crs, where="1=1", bbox=None):
         gdf = gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=crs)
     else:
         gdf = gpd.GeoDataFrame.from_features(fc["features"], crs="EPSG:4326").to_crs(crs)
+    assert expect in (None, len(gdf)), f"paging lost features: {len(gdf)} != {expect}"
     save(gdf, path, layer)
     return gdf
 
@@ -66,8 +77,8 @@ def fetch_region(reg):
     print(f"surface management agency ({reg.sma_where})")
     expected = esri_count(reg.sma, reg.sma_where)
     print(f"  server reports {expected} polygons")
-    sma = fetch_layer(reg.sma, raw / "sma.gpkg", "sma", reg.crs, where=reg.sma_where)
-    assert len(sma) == expected, f"paging lost features: {len(sma)} != {expected}"
+    sma = fetch_layer(reg.sma, raw / "sma.gpkg", "sma", reg.crs, where=reg.sma_where,
+                      expect=expected)
     if reg.owner_field in sma.columns:
         counts = sma[reg.owner_field].value_counts()
         print("  administrators: "
@@ -152,7 +163,7 @@ def fetch_occurrences(sp, reg):
             f"{sp.max_uncertainty_m} m. Raise max_uncertainty_m if a coarser map is still "
             "worth having, but know that is what you are making."
         )
-    save(occ, paths.range_gpkg(sp), "occurrences")
+    save(occ, paths.range_gpkg(sp, reg), "occurrences")
 
 
 def fetch_little(sp, reg):
@@ -182,7 +193,7 @@ def fetch_little(sp, reg):
     rng = rng[rng["CODE"] == 1].to_crs(reg.crs)
     if rng.empty:
         raise SystemExit(f"{sp.slug}: Little's map has no in-range polygons - nothing to screen")
-    save(rng, paths.range_gpkg(sp), "range")
+    save(rng, paths.range_gpkg(sp, reg), "range")
 
 
 def region_bbox(reg):
@@ -248,7 +259,7 @@ def fetch_range(sp, reg):
 
 def main():
     sp = species_mod.resolve(sys.argv)
-    reg = region_mod.resolve()
+    reg = region_mod.resolve(sys.argv)
     print(f"== {sp.common_name} ({sp.binomial}) on {reg.name} public land ==")
 
     fetch_region(reg)

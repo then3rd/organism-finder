@@ -91,7 +91,7 @@ def raw_tile(idx, box, reg):
 
 def class_tile(idx, box, reg, sp, lut):
     """Remap one cached EVT tile to the species' uint8 class codes."""
-    out = paths.work_dir(sp) / f"class_{idx:03d}.tif"
+    out = paths.work_dir(sp, reg) / f"class_{idx:03d}.tif"
     if out.exists():
         return out
     with rasterio.open(raw_tile(idx, box, reg)) as src:
@@ -111,7 +111,7 @@ def class_tile(idx, box, reg, sp, lut):
 
 def main():
     sp = species_mod.resolve(sys.argv)
-    reg = region_mod.resolve()
+    reg = region_mod.resolve(sys.argv)
 
     if not sp.needs_landfire:
         print(f"{sp.common_name}: cover='{sp.cover}', so LANDFIRE has nothing to say "
@@ -123,7 +123,7 @@ def main():
     print(f"{sp.common_name}: {len(hits)} EVT classes")
     for value, name in hits.items():
         print(f"  {codes[value]:>2}  {value}  {name}")
-    paths.codes_path(sp).write_text(
+    paths.codes_path(sp, reg).write_text(
         "code,evt_value,evt_name\n"
         + "".join(f"{codes[v]},{v},{n}\n" for v, n in hits.items())
     )
@@ -147,7 +147,7 @@ def main():
         ))
 
     import subprocess
-    vrt = paths.vrt_path(sp)
+    vrt = paths.vrt_path(sp, reg)
     subprocess.run(
         ["gdalbuildvrt", "-overwrite", str(vrt), *[str(t) for t in tiles]],
         check=True, capture_output=True,

@@ -12,7 +12,9 @@ and no linter config.
 
 Which taxon *and which region* are run-time arguments. Utah juniper (*Juniperus osteosperma*,
 slug `junioste`) is the default and the species the pipeline was built around. Twenty-six taxa
-are registered: fifteen trees, one shrub, seven orchids, and three fungi.
+are registered: fifteen trees, one shrub, seven orchids, and three fungi - plus one entry
+that is not an organism at all, `campsite`, which screens where you may *camp* and marks the
+established primitive campsites (see "Camp mode" below).
 
 Both arguments are **positional and order-free** — `region.resolve()` and `grid.resolve()` scan
 argv for a token they recognise rather than reading a fixed index, because only stage 03 takes
@@ -121,7 +123,8 @@ Three spatial units come out of stage 03 and everything downstream keys off them
 
 All screening layers live in the single `out/<slug>/<slug>.gpkg` (`candidates`, `hotspots`,
 `other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `burns`,
-`water_buffer`, `exclusions`, `field_offices`, `office_points`); stages 04 and 05 both read only from it. Two side-cars sit beside it,
+`water_buffer`, `exclusions`, `field_offices`, `office_points`, and `campsites` in camp mode);
+stages 04 and 05 both read only from it. Two side-cars sit beside it,
 and both are side-cars because stage 03 rewrites that file wholesale: `about.gpkg` holds
 the one-feature fact sheet stage 05 regenerates every run, and `field_notes.gpkg` holds
 what the person carrying the phone wrote down. A notes layer inside `<slug>.gpkg` would be
@@ -275,6 +278,50 @@ is a *result*: stage 03 writes `funnel.csv`, says so, and exits 0 without a GeoP
 no map. The hard errors are reserved for the two geometric filters — a range that misses the
 region, or exclusions that cover all of it — where the setup rather than the ground is wrong.
 
+### Camp mode
+
+`campsite` is a registry entry like any other - `just all campsite [grid] [reg]` - and it
+reuses every stage rather than forking the pipeline. What makes it work is one new value on
+each of three axis fields:
+
+* **`mode="camp"`** asks a third ownership question. `Owner.camp` (FREE / PERMIT / ASK /
+  PROHIBITED) and `Owner.camp_authority` are **required** fields with no fallback to the plant
+  prose, because a plant-permit sentence under "may you camp here" is wrong on every row.
+  BLM and USFS are FREE (dispersed, 14-day limits), NPS and state parks PERMIT (designated
+  sites or backcountry permit), refuges PROHIBITED. SITLA and Idaho's IDL are ASK and marked
+  `# unverified`. Camp mode takes the non-collect branch in stage 03, so Wilderness / WSA /
+  monuments are kept and flagged: backpack camping is lawful in them.
+* **`cover="slope"`** swaps the vegetation raster for USGS 3DEP `Slope Degrees`, fetched by
+  stage 02 in the same EPSG:5070 30 m tiles as EVT (raw tiles taxon-free under
+  `data/work/slope/<reg>/`), thresholded at `Taxon.slope_max_deg` (6 degrees) into a one-class
+  `class.vrt`. `zonal_evt()` then runs **unchanged**: `species_pct` is the flat share of a
+  feature and `evidence` reads `slope <= 6 deg`. `Taxon.needs_raster` is the stage 02 switch.
+  Two things about it are load-bearing. 3DEP computes slope on the fly and returns HTTP 500
+  for a whole 4096 px tile, so each tile is fetched as 1024 px chunks (`SLOPE_CHUNK_PX`) and
+  stitched. And a water surface has zero slope, so `flat_tile()` burns the NHD waterbodies
+  in as not-flat; without that the Great Salt Lake and Lake Powell top the map (1.4 M acres).
+  Exposed lakebed and playa outside the NHD polygons still count as flat.
+* **`kind="campsite"`** is what the prose dispatches on (`Taxon.is_organism`): no scientific
+  name line, no "grows in", no range sentence. `kind` and `mode` are validated together.
+
+Nearness to perennial water is an ordinary WATER condition with `required=False` - a score,
+so `water_pct` leads `rank_order()` and `spread(by_rank=True)` follows that rank rather than
+flat acres. Road access is **not** modelled, and the caveat says so.
+
+The campsites are **markers, not a ranking term** - the user asked for them to be marked, and
+ranking by them would send everybody to the site they could already find. Stage 01
+`fetch_campsites()` merges three sources into `data/raw/<reg>/campsites.gpkg:sites`:
+OpenStreetMap `tourism=camp_site` (the only source with individual primitive pads; OSM
+`access=private/customers/no` rows are dropped), USFS EDW recreation opportunities (a
+"Dispersed Camping" marker is an *area*, not a pad), and BLM's RIDB camping facilities
+(developed). Agency points within 250 m of an OSM point are deduplicated into its `also_in`.
+`osm_class()` sets `site_class` primitive / developed / unclassified. Stage 03 keeps every
+site, attaches the administrator of the ground under it and flags `on_screened`, so a
+campground on a private inholding shows faded rather than vanishing; cells and parcels get an
+informational `campsites` count. Stage 04 writes `campsites.gpx/.kml` (open ground only,
+`P`/`D` name prefixes) and a summary section; stage 05 draws them achromatic by shape -
+filled star primitive, hollow diamond developed - per the cartography rule below.
+
 ### Occurrence screening
 
 `zonal_occurrence()` mirrors `zonal_evt()`: same three output columns, so every caller is
@@ -418,6 +465,20 @@ layers carrying the reader's own material are told apart by *shape* and by
 filled-versus-hollow: the same texture-over-hue argument the exclusion hatch makes. A found
 note and a looked-and-did-not-find note differ by fill, not colour, so the distinction
 survives both colour blindness and a phone screen in the sun.
+
+**The camping map fills its cells by owner**, the one place owner colours fill at full
+visibility. A second `hotspots` layer is drawn through `ownership_renderer(..., symbol=cell_fill)`
+with the camping rule in each legend label, and the magenta flat-% layer is kept but hidden,
+because nearly every qualifying cell is 100 % flat and the ramp says nothing there. It stays
+within the rule above because the magenta layer is off, the cells keep `cell_fill`'s white
+casing, and the wash beneath is the same colours. SITLA has its own ultramarine `#1414b8`,
+split from the other state agencies' `#1565c0` because trust land and a state park have
+different rules. It is darker, not lighter, because every light blue fell to ΔE < 8 against
+the parcel cyan under simulated deuteranopia; this one holds ≥ 19.5 against every owner and
+ramp colour in normal vision and all three CVD simulations.
+USFS is the light lime `#9ccc65` for the same reason in the other direction: its old forest
+green `#33691e` vanished into conifer canopy, and a fully saturated lime falls to ΔE 5-9
+against BLM amber under red-green CVD, which is the boundary USFS ground meets most.
 
 This reasoning is about ground cover, not one plant, so it holds for every taxon. Layer draw
 order matters — the parcel shapeburst is added *after* the cells so it draws on top, and it

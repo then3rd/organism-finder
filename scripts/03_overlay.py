@@ -6,7 +6,8 @@ Three layers doing three different jobs:
                        buffered GBIF records for a plant nobody mapped, nothing when
                        the region is the range
   * cover            - does it grow on *this* ground? LANDFIRE EVT for a woody plant,
-                       distance to a record for everything else
+                       distance to a record for everything else, and for the camping
+                       entry "is it flat enough to sleep on" from 3DEP slope
   * conditions       - and is the ground itself right? A burn window, a distance to
                        water. Empty for every plant; for a fungus it is half the screen,
                        because its cover class names the host stand rather than the
@@ -414,9 +415,10 @@ def rank_order(sp):
 
 
 def cover_scores(gdf, ctx, label):
-    """Score `gdf` by whichever cover method this taxon uses."""
+    """Score `gdf` by whichever cover method this taxon uses. Slope is a class raster in
+    the same grid as EVT, so it goes through the same zonal pass."""
     sp = ctx["sp"]
-    if sp.cover == species_mod.EVT:
+    if sp.needs_raster:
         return zonal_evt(gdf, sorted(ctx["code_name"]), ctx["code_name"], ctx["vrt"],
                          label=label)
     return zonal_occurrence(gdf, ctx["occ"], sp, label=label)
@@ -499,6 +501,39 @@ def load_land(raw, reg):
     return land
 
 
+def load_campsites(reg, land, screenable):
+    """Every campsite stage 01 merged, with the administrator of the ground it sits on.
+
+    All of them are kept, including those on private and tribal land: a well-known
+    campground on a private inholding is exactly what the map should show as *not* open,
+    and silently dropping it would leave a reader wondering why it is missing. `on_screened`
+    is what the counts and the waypoint file select on.
+    """
+    sites = gpd.read_file(paths.campsites_gpkg(reg), layer="sites").to_crs(reg.crs)
+    joined = gpd.sjoin(sites, land[["owner", "owner_name", "public", "geometry"]],
+                       how="left", predicate="within")
+    joined = joined[~joined.index.duplicated()].drop(columns="index_right")
+    joined["owner"] = joined["owner"].fillna(ownership.UNKNOWN.code)
+    joined["owner_name"] = joined["owner_name"].fillna(ownership.UNKNOWN.name)
+    joined["public"] = joined["public"].fillna(False).astype(bool)
+    joined["camp"] = [ownership.owner(c, reg).camp for c in joined["owner"]]
+    joined["on_screened"] = joined["owner"].isin(screenable)
+    return gpd.GeoDataFrame(joined, geometry="geometry", crs=reg.crs)
+
+
+def count_sites(gdf, sites):
+    """Primitive sites on screened land inside each feature. Information, not a score:
+    the user asked for the sites to be marked, and ranking by them would send everybody
+    to the campground they could already find."""
+    out = pd.Series(0, index=gdf.index, dtype=int)
+    if sites is None or not len(sites):
+        return out
+    pts = sites[(sites["site_class"] == "primitive") & sites["on_screened"]]
+    hits = gpd.sjoin(pts[["geometry"]], gdf[["geometry"]], how="inner", predicate="within")
+    counts = hits.groupby("index_right").size()
+    return out.add(counts, fill_value=0).astype(int).loc[gdf.index]
+
+
 def load_range(sp, reg):
     """The range polygon this taxon is filtered by, or None when it has no range filter."""
     gpkg = paths.range_gpkg(sp, reg)
@@ -527,13 +562,13 @@ def main():
 
     code_name = {0: "none"}
     occ = None
-    if sp.cover == species_mod.EVT:
+    if sp.needs_raster:
         codes = pd.read_csv(paths.codes_path(sp, reg))
         code_name.update(dict(zip(codes["code"], codes["evt_name"])))
     else:
         occ = gpd.read_file(paths.range_gpkg(sp, reg), layer="occurrences").to_crs(reg.crs)
     ctx = {"sp": sp, "code_name": code_name, "vrt": vrt, "occ": occ,
-           "grid": shape, "masks": {}, "burn_selection": None}
+           "grid": shape, "masks": {}, "burn_selection": None, "sites": None}
 
     year = datetime.date.today().year
     if sp.conditions:
@@ -567,6 +602,11 @@ def main():
     screened_land = land[land["owner"].isin(screenable)].copy()
     cand = screened_land.copy()
     t.done(f"{len(land):,} SMA polygons, {len(public):,} public, {len(counties)} counties")
+    if sp.mode == species_mod.CAMP:
+        t = Timer("placing campsites on the ownership layer")
+        ctx["sites"] = load_campsites(reg, land, screenable)
+        t.done(f"{len(ctx['sites']):,} sites, "
+               f"{int(ctx['sites']['on_screened'].sum()):,} on ground open to camping")
     print("  screening on: " + ", ".join(
         f"{o.short}" for _, o in ownership.summarize(sorted(set(cand['owner'])), reg)))
 
@@ -640,10 +680,11 @@ def main():
                        acres(cand).sum()))
         check(cand, funnel, "the legal exclusions cover everything in range")
     else:
-        # observe and forage both keep them. Walking into a Wilderness to look at an
-        # orchid is what a Wilderness is for, and picking mushrooms for the pot is
-        # lawful there too - what is closed to a forager is closed by owner (NPS,
-        # refuges) rather than by designation, and `screenable` has already cut that.
+        # observe, forage and camp all keep them. Walking into a Wilderness to look at
+        # an orchid is what a Wilderness is for, picking mushrooms for the pot is lawful
+        # there too, and so is pitching a tent you carried in - what is closed to any of
+        # them is closed by owner (NPS, refuges) rather than by designation, and
+        # `screenable` has already cut that.
         cand = cand.explode(index_parts=False).reset_index(drop=True)
         cand["in_excluded"] = cand.intersects(excl_union)
         print(f"  {sp.mode} mode: keeping {int(cand['in_excluded'].sum()):,} parcels in "
@@ -729,9 +770,12 @@ def main():
 
     cand = cand.sort_values("species_acres", ascending=False).reset_index(drop=True)
     cand["rank"] = np.arange(1, len(cand) + 1)
+    if ctx["sites"] is not None:
+        cand["campsites"] = count_sites(cand, ctx["sites"]).to_numpy()
     # Built rather than written out, so a taxon with no conditions carries no empty
     # columns and one with two carries both.
-    cond_cols = [c for c in sp.condition_columns + ["burn_year"] if c in cand.columns]
+    cond_cols = [c for c in sp.condition_columns + ["burn_year", "campsites"]
+                 if c in cand.columns]
     # Same reasoning as cond_cols: a region whose SMA layer names no designation, or
     # whose state office publishes no LWC inventory, carries neither column rather than
     # carrying one full of nulls that would read as a finding.
@@ -770,6 +814,8 @@ def main():
         ctx["burn_selection"].to_file(gpkg, layer="burns", driver="GPKG")
     if habitat.WATER in ctx["masks"]:
         ctx["masks"][habitat.WATER].to_file(gpkg, layer="water_buffer", driver="GPKG")
+    if ctx["sites"] is not None:
+        ctx["sites"].to_file(gpkg, layer="campsites", driver="GPKG")
     exclusions.to_file(gpkg, layer="exclusions", driver="GPKG")
     admu.to_file(gpkg, layer="field_offices", driver="GPKG")
     gpd.read_file(raw / "admu.gpkg", layer="office").to_crs(reg.crs).to_file(
@@ -787,6 +833,13 @@ def main():
         "%s cells off screened surface (context only)" % ctx["grid"].label,
         len(other), other["species_acres"].sum(),
     ))
+    if ctx["sites"] is not None:
+        # Points, so the acreage column says nothing; 0 rather than a blank keeps the
+        # funnel CSV numeric for stage 04's formatting.
+        prim = ctx["sites"][(ctx["sites"]["site_class"] == "primitive")
+                            & ctx["sites"]["on_screened"]]
+        funnel.append(("established primitive campsites on ground open to camping",
+                       len(prim), 0.0))
     write_funnel(sp, reg, funnel)
     report(funnel)
     print(f"\nstage 03 took {fmt(time.time() - started)}")
@@ -884,7 +937,7 @@ def with_conditions(cols, sp, grid):
     The two column lists are constants because they are the layer contract; conditions
     are per taxon, so they are spliced in rather than written into either list.
     """
-    extra = [c for c in sp.condition_columns + ["burn_year"]
+    extra = [c for c in sp.condition_columns + ["burn_year", "campsites"]
              if c in grid.columns and c not in cols]
     at = cols.index("geometry")
     return cols[:at] + extra + cols[at:]
@@ -904,6 +957,8 @@ def build_hotspots(cand, ctx, reg):
         return empty_cells(reg, HOTSPOT_COLS)
     grid = attach(grid, cand, ["owner", "owner_name", "managing_unit", "county"])
     grid = rank_and_locate(grid, rank_order(ctx["sp"]))
+    if ctx["sites"] is not None:
+        grid["campsites"] = count_sites(grid, ctx["sites"]).to_numpy()
     return grid[with_conditions(HOTSPOT_COLS, ctx["sp"], grid)]
 
 

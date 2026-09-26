@@ -92,7 +92,7 @@ def kinds(conditions):
     """Which condition kinds a taxon uses, in registry order and de-duplicated.
 
     Stage 01 downloads on this rather than on the taxon, so a taxon that wants no burn
-    layer never pays for one - the same shape as `Taxon.needs_landfire`.
+    layer never pays for one - the same shape as `Taxon.needs_raster`.
     """
     seen = []
     for c in conditions:

@@ -50,6 +50,12 @@ def water_gpkg(region):
     return raw_dir(region) / "water.gpkg"
 
 
+def campsites_gpkg(region):
+    """Campsite points from OpenStreetMap, USFS and BLM, raw and merged. Region-scoped and
+    taxon-free: which sites exist does not depend on what the map is for."""
+    return raw_dir(region) / "campsites.gpkg"
+
+
 def evt_csv():
     """The LANDFIRE EVT attribute table. One file for the whole country."""
     return _mk(RAW / "evt") / "LF23_EVT_240.csv"
@@ -64,6 +70,12 @@ def evt_tile_dir(region):
     of stage 02, not an optimisation.
     """
     return _mk(WORK / "evt" / region.key)
+
+
+def slope_tile_dir(region):
+    """Raw 3DEP slope-in-degrees tiles, before the flat/not-flat threshold. Taxon-free
+    for the same reason the raw EVT tiles are: a second slope threshold is local work."""
+    return _mk(WORK / "slope" / region.key)
 
 
 def water_buffer_gpkg(region, metres):

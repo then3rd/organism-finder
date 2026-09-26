@@ -6,6 +6,7 @@ The map itself is <slug>.qgs - see scripts/05_qgis_project.py.
   out/<slug>/hotspots.csv       one row per scouting cell
   out/<slug>/summary.md         per-owner rollup, framed by the taxon's mode
   out/<slug>/scouting.kml/.gpx  spatially spread waypoints for a phone GPS
+  out/<slug>/campsites.kml/.gpx every established campsite on open ground (camp mode only)
 
 `mode` decides whether this reads as a permit document, a place-to-go-look document or a
 foraging one, and which of `Owner.collect` / `Owner.forage` the administrator table asks;
@@ -29,6 +30,7 @@ import simplekml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import factsheet  # noqa: E402
 import grid as grid_mod  # noqa: E402
+import habitat  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
@@ -39,19 +41,27 @@ N_TABLE = 25                # how many of those waypoints summary.md lists
 MIN_SEPARATION_M = 8000     # keep waypoints spread out instead of 50 adjacent cells
 
 
-def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
+def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M, by_rank=False):
     """Pick strong cells that are spread out and cover every managing unit.
 
     Thousands of cells tie at 100 % cover, so a plain greedy pass returns 50 neighbours in
     one canyon. Instead: round-robin over managing units, each time taking that unit's best
     remaining cell that is at least `sep` from everything already picked. Round-robining
     over units rather than owners also keeps one large agency from taking every slot.
+
+    `by_rank` takes each unit's cells in stage 03's rank order rather than by cover acres.
+    It is for a taxon with scoring conditions, whose rank leads with the score - the
+    camping screen ranks by nearness to water first, and acres of flat ground alone would
+    hand back the driest cells on the map.
     """
     if not len(hot):
         return hot
     pts = hot.representative_point()
     xy = np.column_stack([pts.x.to_numpy(), pts.y.to_numpy()])
-    order = np.argsort(-hot["species_acres"].to_numpy(), kind="stable")
+    if by_rank:
+        order = np.argsort(hot["rank"].to_numpy(), kind="stable")
+    else:
+        order = np.argsort(-hot["species_acres"].to_numpy(), kind="stable")
     by_unit = {}
     for i in order:
         by_unit.setdefault(hot["managing_unit"].iat[i], []).append(i)
@@ -76,7 +86,12 @@ def spread(hot, n=N_WAYPOINTS, sep=MIN_SEPARATION_M):
     return hot.iloc[chosen].reset_index(drop=True)
 
 
-def tables(cand, hot, funnel, sp, reg, out):
+def ranked(sp):
+    """Whether waypoints follow stage 03's rank rather than cover acres - see spread()."""
+    return bool(habitat.scores(sp.conditions))
+
+
+def tables(cand, hot, funnel, sp, reg, out, sites=None):
     year = datetime.date.today().year
     # Named rather than assumed: stage 03 chose the lattice and this stage only reports it.
     shape = grid_mod.recall(paths.grid_marker(sp, reg))
@@ -86,7 +101,7 @@ def tables(cand, hot, funnel, sp, reg, out):
     cols = ["rank", "owner", "owner_name", "managing_unit", "county", reg.desig_field,
             "in_lwc", "in_excluded", "land_acres", "species_acres", "species_pct",
             "evidence", "unit_url"]
-    cols += [c for c in sp.condition_columns + ["burn_year"] if c not in cols]
+    cols += [c for c in sp.condition_columns + ["burn_year", "campsites"] if c not in cols]
     c = cand[[x for x in cols if x in cand.columns]].copy()
     pts = cand.representative_point().to_crs(4326)
     c["lat"], c["lon"] = pts.y.round(5).to_numpy(), pts.x.round(5).to_numpy()
@@ -161,7 +176,7 @@ def tables(cand, hot, funnel, sp, reg, out):
             f"{r['species_acres']:,} | {r['cells']:,} |"
         )
 
-    picks = spread(hot).head(N_TABLE)
+    picks = spread(hot, by_rank=ranked(sp)).head(N_TABLE)
     if not len(picks):
         lines += [
             "",
@@ -184,16 +199,27 @@ def tables(cand, hot, funnel, sp, reg, out):
             f"— so these are spread across {reg.name} and across agencies rather than",
             f"{len(picks)} adjacent cells in one canyon. Coordinates are WGS84.",
             "",
-            f"| rank | administrator | unit | county | {sp.short} % | {sp.short} acres | evidence | lat | lon |",
-            "|---:|---|---|---|---:|---:|---|---:|---:|",
+        ]
+        # The camping screen's table carries its ranking score and the campsite count;
+        # every other taxon's table is the one it always had.
+        extra = [c for c in ("water_pct", "campsites")
+                 if sp.mode == species_mod.CAMP and c in picks.columns]
+        head = {"water_pct": "near water %", "campsites": "primitive sites"}
+        lines += [
+            f"| rank | administrator | unit | county | {sp.short} % | {sp.short} acres | "
+            + "".join(f"{head[c]} | " for c in extra) + "evidence | lat | lon |",
+            "|---:|---|---|---|---:|---:|" + "---:|" * len(extra) + "---|---:|---:|",
         ]
         for _, r in picks.iterrows():
             lines.append(
                 f"| {r['rank']} | {r['owner']} | {r['managing_unit']} | {r['county']} | "
-                f"{r['species_pct']:.0f} | {r['species_acres']:.0f} | {r['evidence']} | "
-                f"{r['lat']:.5f} | {r['lon']:.5f} |"
+                f"{r['species_pct']:.0f} | {r['species_acres']:.0f} | "
+                + "".join(f"{r[c]:.0f} | " for c in extra)
+                + f"{r['evidence']} | {r['lat']:.5f} | {r['lon']:.5f} |"
             )
 
+    if sites is not None:
+        lines += campsite_section(sites, hot, reg)
     lines += factsheet.caveats(sp, reg)
     (out / "summary.md").write_text("\n".join(lines))
     print("  -> candidates.csv, hotspots.csv, summary.md")
@@ -201,7 +227,7 @@ def tables(cand, hot, funnel, sp, reg, out):
 
 
 def waypoints(hot, sp, out):
-    picks = spread(hot)
+    picks = spread(hot, by_rank=ranked(sp))
     if not len(picks):
         print("  -> no cells over threshold, skipping scouting.kml / scouting.gpx")
         return
@@ -233,6 +259,127 @@ def waypoints(hot, sp, out):
           f">={MIN_SEPARATION_M/1000:g} km apart)")
 
 
+# --- established campsites (mode="camp") -------------------------------------
+CLASS_ORDER = ("primitive", "developed", "unclassified")
+CLASS_MARK = {"primitive": "P", "developed": "D", "unclassified": "?"}
+
+
+def open_sites(sites):
+    """Sites on ground this screen is open to, primitive first. The rest stay in the
+    GeoPackage and on the map, faded, but a waypoint file is a list of places to drive to."""
+    s = sites[sites["on_screened"].astype(bool)].copy()
+    s["_class"] = s["site_class"].map({c: i for i, c in enumerate(CLASS_ORDER)})
+    return s.sort_values(["_class", "site_id"]).drop(columns="_class")
+
+
+def best_sites(sites, hot, n=N_TABLE, sep=MIN_SEPARATION_M):
+    """Primitive sites in the best-ranked cells, spread out the way the cells are.
+
+    A site takes the rank of the cell it sits in, sites in no qualifying cell go last,
+    and each pick drops everything within `sep` of it - the same reasoning as spread():
+    without it the list is twenty pads along one creek.
+    """
+    prim = sites[sites["site_class"] == "primitive"]
+    if not len(prim):
+        return prim
+    j = gpd.sjoin(prim, hot[["rank", "geometry"]].rename(columns={"rank": "cell_rank"}),
+                  how="left", predicate="within")
+    j = j[~j.index.duplicated()].drop(columns="index_right")
+    j = j.sort_values(["cell_rank", "site_id"], na_position="last")
+    xy = np.column_stack([j.geometry.x.to_numpy(), j.geometry.y.to_numpy()])
+    used = np.zeros(len(j), dtype=bool)
+    chosen = []
+    for i in range(len(j)):
+        if used[i]:
+            continue
+        chosen.append(i)
+        used |= np.hypot(xy[:, 0] - xy[i, 0], xy[:, 1] - xy[i, 1]) < sep
+        if len(chosen) >= n:
+            break
+    return j.iloc[chosen]
+
+
+def campsite_section(sites, hot, reg):
+    """summary.md: how many established sites, on whose ground, and the best of them."""
+    ok = open_sites(sites)
+    lines = [
+        "",
+        "## Established campsites",
+        "",
+        f"{len(sites):,} campsites are mapped in {reg.name} (OpenStreetMap, USFS, BLM); "
+        f"{len(ok):,} sit on",
+        "ground where camping is allowed. Counts are by who administers the ground under",
+        "each site, not by who the source says runs it.",
+        "",
+        "| administrator | " + " | ".join(CLASS_ORDER) + " |",
+        "|---|" + "---:|" * len(CLASS_ORDER),
+    ]
+    table = (ok.groupby(["owner_name", "site_class"]).size().unstack(fill_value=0)
+             .reindex(columns=list(CLASS_ORDER), fill_value=0))
+    table = table.loc[table.sum(axis=1).sort_values(ascending=False).index]
+    for name, r in table.iterrows():
+        lines.append(f"| {name} | " + " | ".join(f"{int(r[c]):,}" for c in CLASS_ORDER)
+                     + " |")
+    best = best_sites(ok, hot)
+    if len(best):
+        pts = best.to_crs(4326)
+        lines += [
+            "",
+            f"### {len(best)} primitive sites in the best-ranked cells",
+            "",
+            f"Taken in cell rank order and spread at least {MIN_SEPARATION_M // 1000} km "
+            "apart. Every open site",
+            "is in `campsites.gpx` / `campsites.kml`, not just these.",
+            "",
+            "| cell rank | site | administrator | source | notes | lat | lon |",
+            "|---:|---|---|---|---|---:|---:|",
+        ]
+        for (_, r), p in zip(best.iterrows(), pts.geometry):
+            rank = "" if pd.isna(r["cell_rank"]) else f"{int(r['cell_rank'])}"
+            name = r["name"] if isinstance(r["name"], str) and r["name"] else "(unnamed)"
+            detail = (r["detail"] or "") if isinstance(r["detail"], str) else ""
+            lines.append(f"| {rank} | {name} | {r['owner']} | {r['source']} | "
+                         f"{detail} | {p.y:.5f} | {p.x:.5f} |")
+    return lines
+
+
+def campsite_waypoints(sites, out):
+    """Every established site on open ground, as its own waypoint file.
+
+    Separate from scouting.gpx on purpose: those are cells to go and look at, these are
+    places somebody has already camped, and a phone should be able to show one without
+    the other.
+    """
+    ok = open_sites(sites)
+    if not len(ok):
+        print("  -> no campsites on open ground, skipping campsites.kml / campsites.gpx")
+        return
+    kml = simplekml.Kml(name="Established campsites")
+    folders = {c: kml.newfolder(name=f"{c} sites") for c in CLASS_ORDER}
+    gpx = gpxpy.gpx.GPX()
+    pts = ok.to_crs(4326)
+    for (_, r), p in zip(ok.iterrows(), pts.geometry):
+        name = r["name"] if isinstance(r["name"], str) and r["name"] else "unnamed"
+        label = f"{CLASS_MARK.get(r['site_class'], '?')} {name}"
+        desc = "\n".join(x for x in (
+            f"{r['site_class']} site ({r['source']})",
+            r["detail"] if isinstance(r["detail"], str) else "",
+            f"fee: {r['fee']}" if isinstance(r["fee"], str) and r["fee"] else "",
+            f"{r['owner_name']} - camping: {r['camp']}",
+            r["url"] if isinstance(r["url"], str) else "",
+        ) if x)
+        folders.get(r["site_class"], folders["unclassified"]).newpoint(
+            name=label, description=desc, coords=[(p.x, p.y)])
+        gpx.waypoints.append(gpxpy.gpx.GPXWaypoint(
+            p.y, p.x, name=label, description=desc,
+            symbol="Campground" if r["site_class"] == "developed" else "Flag, Green"))
+    kml.save(str(out / "campsites.kml"))
+    (out / "campsites.gpx").write_text(gpx.to_xml())
+    counts = ok["site_class"].value_counts()
+    print("  -> campsites.kml, campsites.gpx ("
+          + ", ".join(f"{counts.get(c, 0)} {c}" for c in CLASS_ORDER) + ")")
+
+
 def nothing_qualified(sp, reg, out):
     """Stage 03 found no eligible ground. Write the one thing there is to say.
 
@@ -242,16 +389,16 @@ def nothing_qualified(sp, reg, out):
     # A previous run of this taxon may have qualified - a threshold moved, or the EVT
     # keywords changed. Leaving its deliverables next to a summary saying nothing qualified
     # is the most misleading state this stage can produce, so clear them.
-    for stale in ("candidates.csv", "hotspots.csv", "scouting.kml", "scouting.gpx"):
+    for stale in ("candidates.csv", "hotspots.csv", "scouting.kml", "scouting.gpx",
+                  "campsites.kml", "campsites.gpx"):
         (out / stale).unlink(missing_ok=True)
 
     funnel = pd.read_csv(out / "funnel.csv")
+    intro, meaning = factsheet.nothing_qualified(sp, reg)
     lines = [
         factsheet.heading(sp, reg),
         "",
-        f"**No {reg.name} public ground qualified.** The *{sp.binomial}* range does reach",
-        f"{reg.name} and the cover data for {sp.short} exists here, but no parcel open to a",
-        f"{sp.mode}-mode screen carries enough mapped cover to be worth the drive.",
+        *intro,
         "",
         "## How the acreage narrows",
         "",
@@ -264,10 +411,7 @@ def nothing_qualified(sp, reg, out):
         "",
         "## What this does and does not mean",
         "",
-        f"* {factsheet.title(sp)} grows in {reg.name}. The screening says only that it does not grow",
-        "  in mapped quantity on the public ground this taxon's mode opens up - the rest is",
-        "  private, tribal, or held by an agency that will not permit what you are asking.",
-        "  The `other_cells` layer of a completed run is where that ground would show.",
+        *meaning,
     ]
     lines += factsheet.caveats(sp, reg)
     (out / "summary.md").write_text("\n".join(lines))
@@ -288,8 +432,13 @@ def main():
     funnel = pd.read_csv(out / "funnel.csv")
     print(f"{sp.common_name}: candidates={len(cand)}  hotspots={len(hot)}  "
           f"owners={cand['owner'].nunique()}")
-    tables(cand, hot, funnel, sp, reg, out)
+    sites = None
+    if sp.mode == species_mod.CAMP:
+        sites = gpd.read_file(gpkg, layer="campsites")
+    tables(cand, hot, funnel, sp, reg, out, sites)
     waypoints(hot, sp, out)
+    if sites is not None:
+        campsite_waypoints(sites, out)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from qgis.core import (  # noqa: E402
     QgsVectorLayerSimpleLabeling, QgsCoordinateReferenceSystem,
     QgsCoordinateTransformContext, QgsDatumTransform,
     QgsShapeburstFillSymbolLayer, QgsSimpleLineSymbolLayer, QgsUnitTypes,
-    QgsCategorizedSymbolRenderer, QgsRendererCategory,
+    QgsCategorizedSymbolRenderer, QgsRendererCategory, QgsRuleBasedRenderer,
 )
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 from qgis.PyQt.QtCore import QDate, QMetaType  # noqa: E402
@@ -272,22 +272,25 @@ def washed(fill_color, alpha, line, width, under=CASING_UNDER, under_width=None)
     return sym
 
 
-def ownership_renderer(layer, reg, field="owner"):
+def ownership_renderer(layer, reg, field="owner", symbol=None, label=None):
     """One category per administering agency actually present in the layer.
 
     Driven off the data rather than off a fixed list: a region whose SMA layer names an
     agency the registry has not met still draws, in the registry's `UNKNOWN` grey, and
     reads as "nobody has checked this" - which is what it is.
+
+    `symbol` and `label` take an Owner and default to the translucent wash; the camping
+    map passes its own to fill cells by owner with the same registry colours.
     """
+    symbol = symbol or (lambda o: washed(o.color, LAND_WASH_ALPHA, o.color, width=0.3))
+    label = label or (lambda o: f"{o.short} - {o.name}{'' if o.public else '  (closed)'}")
     idx = layer.fields().indexOf(field)
     if idx < 0:
         raise RuntimeError(f"{layer.name()}: no '{field}' field to categorise on")
     cats = []
     for code in sorted(layer.uniqueValues(idx), key=lambda c: str(c)):
         o = ownership.owner(code, reg)
-        sym = washed(o.color, LAND_WASH_ALPHA, o.color, width=0.3)
-        access = "" if o.public else "  (closed)"
-        cats.append(QgsRendererCategory(code, sym, f"{o.short} - {o.name}{access}"))
+        cats.append(QgsRendererCategory(code, symbol(o), label(o)))
     return QgsCategorizedSymbolRenderer(field, cats)
 
 
@@ -576,6 +579,40 @@ def notes_renderer():
     return QgsCategorizedSymbolRenderer("found", cats)
 
 
+# Campsite markers. Achromatic, by the same rule as the notes and the About point: every
+# hue is spoken for, so these are told apart by shape and fill. Stars and diamonds because
+# triangles are the notes', the square is About's and circles are the offices' and the
+# GBIF records'. Filled means "an established primitive site", the thing the reader came
+# for; hollow means a developed campground, context and fallback.
+SITE_STYLE = {
+    "primitive": ("star", "solid", "3.8", "primitive site"),
+    "developed": ("diamond", "no", "3.0", "developed campground"),
+    "unclassified": ("pentagon", "no", "2.4", "campsite, type not recorded"),
+}
+# A site on ground the screen is not open to - private, tribal, a refuge - is drawn, not
+# dropped, because a well-known campground that silently vanishes is a question, and a
+# faded one is an answer.
+SITE_CLOSED_OPACITY = 0.4
+SITE_LABEL_SCALE = 50000
+
+
+def campsite_renderer():
+    root = QgsRuleBasedRenderer.Rule(None)
+    for closed in (False, True):
+        for value, (shape, style, size, text) in SITE_STYLE.items():
+            sym = QgsMarkerSymbol.createSimple(
+                {"name": shape, "color": MARK if style == "solid" else "#00000000",
+                 "outline_color": MARK if style == "no" else CASING_UNDER,
+                 "outline_width": "0.6" if style == "no" else "0.4", "size": size})
+            if closed:
+                sym.setOpacity(SITE_CLOSED_OPACITY)
+            test = "not \"on_screened\"" if closed else "\"on_screened\""
+            root.appendChild(QgsRuleBasedRenderer.Rule(
+                sym, filterExp=f"\"site_class\" = '{value}' and {test}",
+                label=f"{text}{' (ground not open to camping)' if closed else ''}"))
+    return QgsRuleBasedRenderer(root)
+
+
 def portable(project, notes):
     """Turn the built project into the one that goes on the phone.
 
@@ -755,13 +792,35 @@ def main():
         burns.setRenderer(QgsSingleSymbolRenderer(
             fill("#00000000", outline=BURN, width=0.7, style="no")))
 
+    camp = sp.mode == species_mod.CAMP
     hot = add(project, gpkg_layer(gpkg, "hotspots"),
-              f"{factsheet.CELLS[sp.mode]} (1 km² {shape.label}, {sp.short} %)",
+              f"{factsheet.CELLS[sp.mode]} "
+              + (f"by {sp.short} % (1 km² {shape.label})" if camp
+                 else f"(1 km² {shape.label}, {sp.short} %)"),
               f"{grid_text}. Each cell is clipped to eligible public land and carries at "
               f"least the threshold's worth of {sp.short}; this is the layer the waypoint "
               "files are drawn from.")
     hot.setRenderer(graduated("species_pct", RAMP_CELLS, sp, cell_fill))
     hot.setOpacity(0.65)
+    if camp:
+        # On a camping map the ramp barely varies - most qualifying cells are all flat -
+        # and the question a camper has is whose rules apply. So the same cells are
+        # added again, filled by administrator with the registry colours, and that is
+        # the one shown; the flat-ground ramp stays in the legend, switched off. Safe
+        # against the palette rule because the magenta layer is hidden, the cells keep
+        # cell_fill's white casing, and the wash beneath is the same colours.
+        hide(project, hot)
+        verbs = factsheet.PLAIN_VERBS["camp"]
+        by_owner = add(
+            project, gpkg_layer(gpkg, "hotspots"),
+            f"{factsheet.CELLS[sp.mode]} by administrator (1 km² {shape.label})",
+            f"{grid_text}. The same cells as the flat-ground layer, coloured by who "
+            f"administers the ground; {sp.short} % is in the attributes and in the "
+            "hidden 'by flat ground %' layer.")
+        by_owner.setRenderer(ownership_renderer(
+            by_owner, reg, symbol=lambda o: cell_fill(o.color),
+            label=lambda o: f"{o.short} - camping: {verbs[o.camp]}"))
+        by_owner.setOpacity(0.6)
 
     # added after the cells so it draws on top: the gradient is transparent in the
     # middle, so it rims the parcel without hiding the cells inside it
@@ -784,6 +843,24 @@ def main():
             {"name": "circle", "color": RANGE, "outline_color": "#ffffff",
              "outline_width": "0.3", "size": "2"}
         )))
+
+    # Above the cells and parcels, below the offices and the reader's own layers: the
+    # sites are the reason to zoom in, and a cell drawn over them would hide the answer.
+    sites = gpkg_layer(gpkg, "campsites")
+    if sites.isValid() and sites.featureCount():
+        add(project, sites, f"Established campsites ({sites.featureCount():,})",
+            "Campsites from OpenStreetMap, the Forest Service and BLM. Filled stars are "
+            "primitive sites, hollow diamonds developed campgrounds; faded markers sit on "
+            "ground where camping is not open (private, tribal, refuges). OpenStreetMap is "
+            "crowd-sourced, and a USFS 'dispersed camping' marker is an area rather than "
+            "a pad. Markers only - the cells are not ranked by them.")
+        sites.setRenderer(campsite_renderer())
+        label_with(sites, "coalesce(\"name\", '')", expression=True, size=8)
+        labeling = sites.labeling().settings()
+        labeling.scaleVisibility = True
+        labeling.maximumScale = 0
+        labeling.minimumScale = SITE_LABEL_SCALE
+        sites.setLabeling(QgsVectorLayerSimpleLabeling(labeling))
 
     offices = add(project, gpkg_layer(gpkg, "office_points"), "BLM offices",
                   "Where to ask. Field and district offices, labelled by unit name.")

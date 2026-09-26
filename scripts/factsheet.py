@@ -38,15 +38,35 @@ WHAT = {
     "collect": "transplant permit screening",
     "observe": "where to go and look",
     "forage": "where to go and pick",
+    "camp": "where to camp",
 }
 # The scouting-grid layer name on the map.
 CELLS = {"collect": "Scouting cells", "observe": "Viewing cells",
-         "forage": "Foraging cells"}
+         "forage": "Foraging cells", "camp": "Camping cells"}
 # "## 25 places to scout"
 GOING = {"collect": "to scout", "observe": "to go and look",
-         "forage": "to go and pick"}
+         "forage": "to go and pick", "camp": "to camp"}
 # The waypoint file's own name for what it is.
-ACTIVITY = {"collect": "scouting", "observe": "viewing", "forage": "foraging"}
+ACTIVITY = {"collect": "scouting", "observe": "viewing", "forage": "foraging",
+            "camp": "camping"}
+
+# The answer column of the administrator table, per taking field. Camping gets its own
+# words because "yes, with a permit" reads as a plant permit, and what NPS actually offers
+# is a designated site or a backcountry permit.
+VERBS = {
+    "collect": {ownership.FREE: "yes, personal use, no permit",
+                ownership.PERMIT: "yes, with a permit",
+                ownership.ASK: "case by case - ask first",
+                ownership.PROHIBITED: "no"},
+    "camp": {ownership.FREE: "yes, dispersed, no permit",
+             ownership.PERMIT: "designated sites or permit only",
+             ownership.ASK: "case by case - ask first",
+             ownership.PROHIBITED: "no"},
+}
+VERBS["forage"] = VERBS["collect"]
+# The same answers without the leading "yes, " - owner_plain's shorter form.
+PLAIN_VERBS = {f: {k: v.removeprefix("yes, ") for k, v in d.items()}
+               for f, d in VERBS.items()}
 
 
 def project_title(sp, reg):
@@ -81,6 +101,9 @@ def how(sp, samples=None, year=None):
             f"**LANDFIRE EVT 30 m** (where {sp.short} actually grows). There is no range "
             "filter: this plant occupies the region broadly enough that a range polygon "
             "would narrow nothing",
+        (None, species_mod.SLOPE):
+            f"**USGS 3DEP 30 m slope** (ground at or below {sp.slope_max_deg:g} degrees - "
+            "flat enough to park and pitch on)",
         (species_mod.GBIF, species_mod.OCCURRENCE):
             f"{records} buffered by "
             f"their own stated accuracy (at least {sp.occurrence_buffer_m} m). This is a "
@@ -97,6 +120,9 @@ def how(sp, samples=None, year=None):
             f"**{c.label(year)}**" if c.required else f"scored by *{c.label(year)}*"
             for c in sp.conditions
         )
+    if sp.mode == species_mod.CAMP:
+        text += (", with established campsites from **OpenStreetMap, USFS and BLM** "
+                 "marked on top - markers only, never a ranking term")
     return text
 
 
@@ -117,11 +143,16 @@ def range_text(sp):
         return (f"GBIF occurrence records, taxon key {sp.gbif_key}, buffered by each "
                 f"record's own stated accuracy - at least {sp.occurrence_buffer_m} m, and "
                 f"records looser than {sp.max_uncertainty_m} m dropped")
+    if not sp.is_organism:
+        return "none - the whole region is screened"
     return ("none - the region is the range, which is only honest for a plant that "
             "occupies it broadly")
 
 
 def cover_text(sp):
+    if sp.cover == species_mod.SLOPE:
+        return (f"USGS 3DEP slope at 30 m, ground at or below {sp.slope_max_deg:g} "
+                "degrees counted as flat")
     if sp.cover == species_mod.EVT:
         whose = "host community" if sp.kind == "fungus" else "community"
         text = (f"LANDFIRE EVT 30 m modelled cover, {whose} keywords: "
@@ -144,6 +175,35 @@ def conditions_text(sp, year=None):
     )
 
 
+def nothing_qualified(sp, reg):
+    """The two passages of a summary.md for a run where no ground qualified: what
+    happened, and what it does and does not mean. Returned as (intro, meaning) lines."""
+    if not sp.is_organism:
+        intro = [
+            f"**No {reg.name} public ground qualified.** No parcel open to camping carries",
+            f"enough {sp.short} to be worth the drive.",
+        ]
+        meaning = [
+            f"* There is flat ground in {reg.name}. The screening says only that none of it",
+            "  lies on public ground where camping is allowed - the rest is private, tribal,",
+            "  or held by an agency that does not allow it.",
+            "  The `other_cells` layer of a completed run is where that ground would show.",
+        ]
+        return intro, meaning
+    intro = [
+        f"**No {reg.name} public ground qualified.** The *{sp.binomial}* range does reach",
+        f"{reg.name} and the cover data for {sp.short} exists here, but no parcel open to a",
+        f"{sp.mode}-mode screen carries enough mapped cover to be worth the drive.",
+    ]
+    meaning = [
+        f"* {title(sp)} grows in {reg.name}. The screening says only that it does not grow",
+        "  in mapped quantity on the public ground this taxon's mode opens up - the rest is",
+        "  private, tribal, or held by an agency that will not permit what you are asking.",
+        "  The `other_cells` layer of a completed run is where that ground would show.",
+    ]
+    return intro, meaning
+
+
 def owner_note(sp, reg, codes):
     """The per-owner authority paragraph. This is the part that changes with ownership.
 
@@ -152,15 +212,13 @@ def owner_note(sp, reg, codes):
     without paperwork and will let you fill a bag with morels without any.
     """
     field = ownership.taking(sp.mode) or "collect"
-    question = ("may mushrooms be taken?" if sp.mode == species_mod.FORAGE
-                else "may a plant be taken?")
+    question = {species_mod.FORAGE: "may mushrooms be taken?",
+                species_mod.CAMP: "may you camp here?"}.get(sp.mode,
+                                                            "may a plant be taken?")
     lines = ["", "## Who administers it, and what that means", "",
              f"| administrator | ground | {question} |", "|---|---|---|"]
     for _, o in ownership.summarize(codes, reg):
-        verb = {ownership.FREE: "yes, personal use, no permit",
-                ownership.PERMIT: "yes, with a permit",
-                ownership.ASK: "case by case - ask first",
-                ownership.PROHIBITED: "no"}[getattr(o, field)]
+        verb = VERBS[field][getattr(o, field)]
         lines.append(f"| {o.name} ({o.short}) | {o.tenure} | {verb} |")
     lines.append("")
     if sp.mode == species_mod.OBSERVE:
@@ -178,6 +236,13 @@ def owner_note(sp, reg, codes):
             "below say who to ask; none of them is a substitute for asking.",
             "",
         ]
+    if sp.mode == species_mod.CAMP:
+        lines += [
+            "Stay limits, fire restrictions and closures are set field office by field",
+            "office and forest by forest, and fire restrictions change week to week in",
+            "summer. The bullets below say who to ask; none of them is a substitute for it.",
+            "",
+        ]
     for _, o in ownership.summarize(codes, reg):
         lines.append(textwrap.fill(
             f"* **{o.short}** - {ownership.authority_for(o, sp.mode)}.",
@@ -189,14 +254,12 @@ def owner_note(sp, reg, codes):
 def owner_plain(sp, reg, codes):
     """The same answers as one plain block: who administers it, and what may be taken."""
     field = ownership.taking(sp.mode) or "collect"
-    verbs = {ownership.FREE: "personal use, no permit",
-             ownership.PERMIT: "with a permit",
-             ownership.ASK: "case by case - ask first",
-             ownership.PROHIBITED: "no"}
+    verbs = PLAIN_VERBS[field]
+    what = "camping" if sp.mode == species_mod.CAMP else "taking"
     out = []
     for _, o in ownership.summarize(codes, reg):
         answer = ("" if sp.mode == species_mod.OBSERVE
-                  else f" - taking: {verbs[getattr(o, field)]}")
+                  else f" - {what}: {verbs[getattr(o, field)]}")
         out.append(f"{o.short} ({o.name}, {o.tenure}){answer}")
     return "\n".join(out)
 
@@ -204,9 +267,32 @@ def owner_plain(sp, reg, codes):
 def caveats(sp, reg):
     """The closing section. Says what the screening does not model, in either mode."""
     head = {"collect": "## Before you dig", "observe": "## Before you go",
-            "forage": "## Before you pick"}[sp.mode]
+            "forage": "## Before you pick", "camp": "## Before you camp"}[sp.mode]
     lines = ["", head, ""]
-    if sp.mode == species_mod.FORAGE:
+    if sp.mode == species_mod.CAMP:
+        lines += [
+            "* **This map finds legal, flat ground and marks known sites; it does not find",
+            "  a road to them.** Access, travel-management closures and seasonal gates are",
+            "  not modelled. On Forest Service ground drive only on the routes the Motor",
+            "  Vehicle Use Map shows, and on BLM ground only on existing routes.",
+            "* Use an established site where there is one - the markers are there for that -",
+            "  rather than flattening a new one. Stay limits are typically 14 days, after",
+            "  which you move on; the table above says whose rule applies.",
+            "* Camp at least 200 ft (61 m) from lakes and streams even though cells are",
+            "  ranked by nearness to water, and pack out everything, human waste included",
+            "  where the ground or the rules require it.",
+            "* Fire restrictions, burn bans and closure orders are not modelled and change",
+            "  week to week in summer. Check the administering unit before you light",
+            "  anything, including a stove in some stages of restriction.",
+            "* Wilderness, WSAs and monuments are *included* rather than subtracted: camping",
+            "  is lawful in them, but no vehicles, no mechanised travel, and some units",
+            "  require permits or designated sites. What is closed to a camper is closed by",
+            "  administrator, and those owners are already out of the screened ground.",
+            "* Developed campgrounds are drawn as hollow diamonds for context and fallback;",
+            "  primitive sites are stars. The campsite markers are mostly OpenStreetMap, which",
+            "  is crowd-sourced, and a marker on ground you may not camp on is drawn faded.",
+        ]
+    elif sp.mode == species_mod.FORAGE:
         lines += [
             "* **This map finds habitat, not mushrooms, and it identifies nothing.** Every",
             "  cell on it is a place the host stand and the conditions line up; whether",
@@ -269,7 +355,11 @@ def caveats(sp, reg):
             "  Treat them accordingly: do not repost the waypoints, and do not lead anyone",
             "  to a patch you would not want dug.",
         ]
-    src = ("LANDFIRE EVT is 30 m *modelled* cover, and for a fungus it is describing the "
+    src = ("3DEP slope is a 30 m average: a steep pixel can hold a flat bench and a flat "
+           "one a gully, so the percentage is how much of a cell is broadly level, not "
+           "where to pitch."
+           if sp.cover == species_mod.SLOPE else
+           "LANDFIRE EVT is 30 m *modelled* cover, and for a fungus it is describing the "
            "host stand rather than the organism - the percentage on this map is host "
            "cover, and the fungus may be in none of it."
            if sp.kind == "fungus" else
@@ -281,7 +371,7 @@ def caveats(sp, reg):
            "absence of records is absence of records.")
     lines.append(textwrap.fill(
         "* " + src + " Ground-truth "
-        + ("this before acting on it - " if sp.kind == "fungus"
+        + ("this before acting on it - " if sp.kind == "fungus" or not sp.is_organism
            else "the species before acting on this - ")
         + sp.ground_truth_caveat,
         width=90, subsequent_indent="  ",
@@ -293,10 +383,12 @@ def caveats(sp, reg):
         lines.append(
             "* Lands with wilderness characteristics (`in_lwc`) are not closed, but "
             "expect scrutiny.")
+    shows = ("where flat ground is" if sp.cover == species_mod.SLOPE
+             else "where the stands are")
     lines += [
         "* The `other_cells` layer in the GeoPackage grids the same screen over ground this",
         "  document cannot act on - private, tribal, closed withdrawals, and any public owner",
-        f"  this taxon's {sp.mode} mode rules out. It shows where the stands are and confers",
+        f"  this taxon's {sp.mode} mode rules out. It shows {shows} and confers",
         "  nothing. Nothing above is derived from it.",
         "",
     ]
@@ -352,9 +444,16 @@ def abstract(sp, reg, grid=None, codes=(), samples=None, when=None):
         "",
         textwrap.fill(plain(method(sp, reg, samples, year)), width=88),
         "",
-        f"Scientific name: {sp.binomial}",
-        f"Common name: {title(sp)}",
-        f"Kind: {sp.kind}",
+    ]
+    if sp.is_organism:
+        out += [
+            f"Scientific name: {sp.binomial}",
+            f"Common name: {title(sp)}",
+            f"Kind: {sp.kind}",
+        ]
+    else:
+        out.append(f"Screen: {title(sp)} ({sp.binomial})")
+    out += [
         f"Range: {range_text(sp)}",
         f"Cover: {cover_text(sp)}",
         f"Habitat conditions: {conditions_text(sp, year)}",
@@ -372,7 +471,7 @@ if __name__ == "__main__":
     import region as region_mod
 
     _reg = region_mod.resolve(sys.argv)
-    for _slug in ("junioste", "platdila", "morcelat"):
+    for _slug in ("junioste", "platdila", "morcelat", "campsite"):
         _sp = species_mod.resolve(["", _slug])
         print("=" * 78)
         print(abstract(_sp, _reg, grid="1 km2 hex",

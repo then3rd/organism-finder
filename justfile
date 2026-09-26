@@ -1,4 +1,5 @@
-# Plants and fungi x public land - where it grows, and who administers the ground
+# Plants and fungi x public land - where it grows, and who administers the ground.
+# Plus one entry that is not an organism: where you may camp.
 #
 # Every recipe takes a species slug from scripts/species.py; `just species` lists them,
 # and a trailing region key; `just owners <key>` lists those. Region defaults to `ut`.
@@ -6,6 +7,7 @@
 #   just all pinuedul            # two-needle pinyon
 #   just all junioste square     # the same screen, drawn on a square lattice
 #   just all junioste hex id     # the same taxon, screened in Idaho
+#   just all campsite            # not a plant: where to camp, with campsites marked
 #
 # Note the grid must be spelled when naming a region on `overlay` and `all`, because
 # they are positional: `just overlay junioste id` binds id to the grid slot and the

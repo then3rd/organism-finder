@@ -116,6 +116,33 @@ class Region:
         "fcode IN (39004,39009,39010,39011,39012,43600,43601,43613,43617,43618,"
         "43619,43621,43624,43625,43626)"
     )
+    # --- camping (mode="camp") --------------------------------------------------
+    # ISO 3166-2 code for an Overpass `area` query. An area clips to the state boundary
+    # exactly, where the county bbox would drag in every campsite along the neighbours'
+    # borders. Required: a region that forgets it would query OpenStreetMap for nothing.
+    osm_area: str = ""
+    # National services, narrowed by the county envelope at fetch time like the fire and
+    # NHD layers. The USFS layer marks rec *areas* by activity; "Dispersed Camping" there
+    # is an area where dispersed camping is managed, not an individual pad.
+    usfs_rec: str = (
+        "https://apps.fs.usda.gov/arcx/rest/services/EDW/"
+        "EDW_RecreationOpportunities_01/MapServer/0"
+    )
+    usfs_camp_where: str = (
+        "markeractivity IN ('Dispersed Camping','Campground Camping','Group Camping',"
+        "'Horse Camping','OHV Camping','RV Camping')"
+    )
+    # BLM's recreation.gov (RIDB) camping facilities. Its State column is not the state
+    # name, so the bbox does the narrowing rather than a where clause.
+    blm_camp: str = (
+        "https://gis.blm.gov/arcgis/rest/services/recreation/"
+        "BLM_Natl_Recreation_Sites_Facilities/MapServer/8"
+    )
+    # USGS 3DEP, for slope cover. Queried in the LANDFIRE grid so the slope class tiles
+    # line up with the EVT ones pixel for pixel.
+    dem_imageserver: str = (
+        "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer"
+    )
 
 
 UTAH = Region(
@@ -135,6 +162,7 @@ UTAH = Region(
     ),
     counties_where="STATE='49'",
     gbif_state="Utah",
+    osm_area="US-UT",
     # Utah's NLCS services publish an "(Arc)" boundary-line layer first, so the polygon
     # layer wanted here is layer 1 (layer 2 for wild & scenic river corridors). That is a
     # fact about Utah's services, not a rule - Idaho's publish the polygons at layer 0.
@@ -168,6 +196,7 @@ IDAHO = Region(
     ),
     counties_where="STATE='16'",
     gbif_state="Idaho",
+    osm_area="US-ID",
     # Idaho's SMA layer carries MGMT_AGNCY and AGNCY_NAME and neither a DESIG nor an
     # OWNER column, so `desig_field` is None and `excluded_desig` is never consulted -
     # the three NLCS layers below carry the whole legal-exclusion answer here.

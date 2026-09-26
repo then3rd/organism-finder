@@ -31,6 +31,13 @@ the two things a tree entry bundled together are now separate fields:
                    organism in the ground, so it asks `Owner.forage` rather than
                    `Owner.collect` and keeps Wilderness the way observe does.
 
+Camping is the one entry that is not an organism at all, and it fits for the same reason
+the fungi do: the question is still "which public ground, administered by whom, carries
+the thing I want". `mode="camp"` asks `Owner.camp` - may you pitch a tent here - and
+`cover="slope"` swaps the vegetation raster for USGS 3DEP slope, so `species_pct` reads as
+the share of a cell flat enough to sleep on. Established campsites are *markers* on that
+map (stage 01 `fetch_campsites`), not a ranking term.
+
 Fungi add a fourth field, `conditions`, and it is what makes them screenable at all.
 Their cover layer names the *host* community rather than the organism - LANDFIRE has a
 class for Douglas-fir and none for the morels that come up under it - so the host stand
@@ -48,8 +55,8 @@ import habitat
 ATLAS = "https://raw.githubusercontent.com/wpetry/USTreeAtlas/master/geojson"
 
 LITTLE, GBIF = "little", "gbif"
-EVT, OCCURRENCE = "evt", "occurrence"
-COLLECT, OBSERVE, FORAGE = "collect", "observe", "forage"
+EVT, OCCURRENCE, SLOPE = "evt", "occurrence", "slope"
+COLLECT, OBSERVE, FORAGE, CAMP = "collect", "observe", "forage", "camp"
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,12 @@ class Taxon:
     # the coordinates and the waypoint file are the same ones every other taxon gets.
     sensitive: bool = False
 
+    # --- slope screening (camping) ---------------------------------------------
+    # Ground at or below this many degrees counts as flat. 6 degrees is about a 10 %
+    # grade: a car parks on it, a tent pitches on it, and 30 m slope is smooth enough that
+    # the benches inside a steeper pixel are invisible anyway.
+    slope_max_deg: float = 6.0
+
     def __post_init__(self):
         if self.cover == EVT and not self.evt_include:
             raise ValueError(f"{self.slug}: cover='evt' needs evt_include keywords")
@@ -102,6 +115,12 @@ class Taxon:
         for c in self.conditions:
             if c.kind not in habitat.KINDS:
                 raise ValueError(f"{self.slug}: unknown condition kind {c.kind!r}")
+        if (self.kind == "campsite") != (self.mode == CAMP):
+            # Camp mode asks Owner.camp; a plant asking it would print camping law over a
+            # plant map, and a camping entry asking anything else would print plant law.
+            raise ValueError(f"{self.slug}: kind='campsite' and mode='camp' go together")
+        if self.cover == SLOPE and self.range_source is not None:
+            raise ValueError(f"{self.slug}: slope cover has no range - the region is it")
         if self.kind == "fungus" and not self.conditions:
             # An EVT class names the host stand, which is most of Utah's forest. Without
             # a condition the map would be "here is where trees are" wearing a mushroom
@@ -113,9 +132,16 @@ class Taxon:
         return f"{ATLAS}/{self.slug}.geojson"
 
     @property
-    def needs_landfire(self):
-        """Stage 02 is a no-op for a plant LANDFIRE cannot see."""
-        return self.cover == EVT
+    def needs_raster(self):
+        """Stage 02 builds a class raster for EVT and slope cover, and is a no-op for a
+        plant LANDFIRE cannot see."""
+        return self.cover in (EVT, SLOPE)
+
+    @property
+    def is_organism(self):
+        """False for the camping entry, whose `binomial` is a phrase rather than a name
+        and which the prose must not describe as growing anywhere."""
+        return self.kind != "campsite"
 
     @property
     def condition_columns(self):
@@ -597,6 +623,40 @@ TAXA = {t.slug: t for t in (
             "calendar."
         ),
     ),
+    # --- not an organism --------------------------------------------------------
+    # Where to sleep on public land. The screen is jurisdiction (Owner.camp), flat ground
+    # from 3DEP slope as the cover, and nearness to perennial water as a *score*: a cell
+    # far from water is a dry camp, not a wrong one. Campsite points ride along as markers.
+    Taxon(
+        slug="campsite",
+        binomial="dispersed camping",
+        common_name="camping ground",
+        short="flat ground",
+        kind="campsite",
+        range_source=None, cover=SLOPE, mode=CAMP,
+        slope_max_deg=6.0,
+        conditions=(
+            habitat.Condition(
+                habitat.WATER,
+                required=False,
+                metres=800,
+                note=(
+                    "Cells are ranked by how much of them lies within 800 m of a perennial "
+                    "stream or lake - a walk to fetch water, not a place to pitch. Camp at "
+                    "least 200 ft (61 m) from the water itself: most agencies require it, "
+                    "and wildlife and the next camper need the shore"
+                ),
+            ),
+        ),
+        ground_truth_caveat=(
+            "Road access is not modelled at all - a flat cell beside a stream can be twenty "
+            "miles from anything you can drive, and a road on the imagery may be closed to "
+            "vehicles on the travel-management map. Campsite markers are largely "
+            "OpenStreetMap, which is crowd-sourced: a mapped site may since have been "
+            "closed, gated or rehabilitated. 30 m slope smooths away both the small bench "
+            "that makes a steep cell campable and the gully that ruins a flat one."
+        ),
+    ),
 )}
 
 # Callers written when this was a tree-only
@@ -640,7 +700,7 @@ if __name__ == "__main__":
 
     _year = datetime.date.today().year
     _how = {("little", "evt"): "Little x EVT", (None, "evt"): "EVT only",
-            ("gbif", "occurrence"): "GBIF records"}
+            ("gbif", "occurrence"): "GBIF records", (None, "slope"): "3DEP slope"}
     for _t in TAXA.values():
         _d = " (default)" if _t.slug == DEFAULT else ""
         _s = "  sensitive" if _t.sensitive else ""
@@ -649,9 +709,9 @@ if __name__ == "__main__":
         _method = _how.get((_t.range_source, _t.cover), "?")
         if _t.kind == "fungus" and _t.cover == EVT:
             _method = "EVT host"
-        print(f"  {_t.slug:10} {_t.kind:<6} {_t.mode:<8} "
+        print(f"  {_t.slug:10} {_t.kind:<8} {_t.mode:<8} "
               f"{_method:<13} "
               f"{_t.common_name:<28} {_t.binomial}{_d}{_s}")
         for _c in _t.conditions:
             _gate = "must be" if _c.required else "prefers"
-            print(f"  {'':10} {'':6} {'':8} {'':13} ... {_gate} {_c.label(_year)}")
+            print(f"  {'':10} {'':8} {'':8} {'':13} ... {_gate} {_c.label(_year)}")

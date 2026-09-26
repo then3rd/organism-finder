@@ -29,6 +29,10 @@ Two fields drive behaviour rather than display:
                 *collect*-mode taxon may be screened on; an *observe*-mode taxon ignores
                 it, because looking at an orchid in a national park is not a permit
                 question.
+  * `camp`    - may you stay the night, and how: FREE is dispersed camping with no
+                permit (BLM, USFS), PERMIT is designated sites or a backcountry permit
+                (national and state parks). Screened by camp mode, which asks nothing
+                about what may be taken.
   * `forage`  - the same question for mushrooms, and it is a genuinely different one.
                 Picking a fungal fruiting body leaves the organism in the ground, so most
                 agencies that will not let you dig a plant will let you fill a bag with
@@ -43,8 +47,8 @@ PERMIT = "permit"          # a permit exists and is routinely issued
 ASK = "ask"                # case by case; no standing programme
 PROHIBITED = "prohibited"  # categorically not available
 
-# FREE is a forage answer only. No agency here lets anybody dig a live plant without
-# paperwork, and if one ever does, it belongs on `collect` as a deliberate edit.
+# FREE is a forage or camp answer only. No agency here lets anybody dig a live plant
+# without paperwork, and if one ever does, it belongs on `collect` as a deliberate edit.
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,13 @@ class Owner:
     # Mushrooms. Required rather than defaulted, because a silent default here would be
     # the registry quietly guessing at somebody's regulations.
     forage: str
+    # Camping, and the third question rather than a variant of the first two: nothing
+    # leaves the ground, but you stay on it overnight, and the agencies that will sell you
+    # a plant permit have entirely separate rules for that. Both fields required, and the
+    # prose has no fallback - a plant-permit sentence under "may you camp here" is wrong
+    # on every row, not merely imprecise.
+    camp: str
+    camp_authority: str
     # Only where the mushroom answer differs materially from the plant one. Blank falls
     # back to `authority`, so agencies that treat both the same are written once.
     forage_authority: str = ""
@@ -87,10 +98,22 @@ _FEDERAL = (
             "permit; the field office sets any local limit and sells the permit "
             "commercial pickers need, so ask before selling anything"
         ),
+        camp=FREE,
+        camp_authority=(
+            "Dispersed camping is allowed on most BLM ground for 14 days in any 28, after "
+            "which you move at least 25 miles; the field office posts closures and "
+            "designated-sites-only areas, and a developed recreation site follows its own "
+            "rules and fees"
+        ),
     ),
     Owner(
         code="USFS", name="U.S. Forest Service", short="USFS",
-        tenure="federal", public=True, collect=PERMIT, forage=FREE, color="#33691e",
+        # Light lime rather than the forest green it was: a dark green disappears into
+        # conifer canopy on the imagery, which is exactly where Forest Service ground is.
+        # Not a fully saturated lime either - those collapse into BLM's amber under
+        # simulated deuteranopia and protanopia (dE 5-9), and BLM is the neighbour USFS
+        # ground meets most. This one holds dE >= 19.7 against every owner and ramp colour.
+        tenure="federal", public=True, collect=PERMIT, forage=FREE, color="#9ccc65",
         authority=(
             "The ranger district issues free-use and charge permits for plants and "
             "transplants; terms and species lists differ forest by forest, and some "
@@ -100,6 +123,13 @@ _FEDERAL = (
             "Most ranger districts allow personal-use mushrooms free up to a daily "
             "gallon limit, but several require a free-use permit picked up in person "
             "and a few close burned areas outright - ring the district before driving"
+        ),
+        camp=FREE,
+        camp_authority=(
+            "Dispersed camping is allowed across most of a national forest for 14 days "
+            "(16 on some forests) outside developed sites; drive only on routes the Motor "
+            "Vehicle Use Map shows, park within the dispersed-camping corridors it marks, "
+            "and ring the district for area closures"
         ),
     ),
     Owner(
@@ -116,6 +146,12 @@ _FEDERAL = (
             "prohibited unless that unit's superintendent's compendium says otherwise, "
             "which few compendia in these states do"
         ),
+        camp=PERMIT,
+        camp_authority=(
+            "Camping in a park unit is in a designated campground or under a backcountry "
+            "permit from that park; roadside and dispersed camping are prohibited "
+            "throughout the park system"
+        ),
     ),
     Owner(
         code="USFWS", name="U.S. Fish and Wildlife Service", short="USFWS",
@@ -129,6 +165,11 @@ _FEDERAL = (
             "Refuge collection of any kind needs a Special Use Permit, and mushrooms "
             "are not what those are issued for"
         ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "Camping on a National Wildlife Refuge is prohibited except in an area the "
+            "refuge designates for it, and few refuges in these states have one"
+        ),
     ),
     Owner(
         code="BR", name="Bureau of Reclamation", short="BOR",
@@ -137,22 +178,41 @@ _FEDERAL = (
             "Reclamation withdrawals have no standing plant-permit programme; ask the "
             "area office, and expect the answer to depend on the project"
         ),
+        camp=ASK,
+        camp_authority=(
+            "Reclamation reservoirs often have campgrounds run by a partner agency; "
+            "whether dispersed camping is allowed depends on the project, so ask the area "
+            "office"
+        ),
     ),
     Owner(
         code="DOD", name="Department of Defense", short="DOD",
         tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#37474f",
         authority="Closed military withdrawal - no public entry, let alone collection",
+        camp=PROHIBITED,
+        camp_authority=(
+            "Closed military withdrawal - no public entry, let alone an overnight stay"
+        ),
     ),
     Owner(
         code="DOE", name="Department of Energy", short="DOE",
         tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#37474f",
         authority="Closed federal withdrawal - no public entry",
+        camp=PROHIBITED,
+        camp_authority=(
+            "Closed federal withdrawal - no public entry"
+        ),
     ),
     Owner(
         code="OF", name="other federal", short="other fed",
         tenure="federal", public=True, collect=ASK, forage=ASK, color="#607d8b",
         authority="Federal ground held by an agency this registry does not name - identify "
                   "the administering agency before assuming anything",
+        camp=ASK,
+        camp_authority=(
+            "Federal ground held by an agency this registry does not name - identify the "
+            "administrator and its camping rules before pitching a tent"
+        ),
     ),
 )
 
@@ -163,7 +223,12 @@ _UTAH_STATE = (
     Owner(
         code="SITLA", name="School and Institutional Trust Lands Administration",
         short="SITLA", tenure="state", public=True, collect=PERMIT, forage=ASK,
-        color="#1565c0",
+        # Its own blue, not the state agencies' #1565c0: trust land and a state park have
+        # different rules, and the camping map fills cells by owner. Darker rather than
+        # lighter because every light blue collided with the parcel cyan under simulated
+        # deuteranopia; this one holds dE >= 19.5 against every owner and ramp colour in
+        # normal vision and all three CVD simulations, and >= 22.9 against the state blue.
+        color="#1414b8",
         authority=(
             "Trust land is managed to make money for the school fund, not for public "
             "recreation; SITLA issues a special-use lease or permit and charges for the "
@@ -174,16 +239,32 @@ _UTAH_STATE = (
             "permit and gathering anything of value is a separate conversation with the "
             "area office"
         ),
+        camp=ASK,  # unverified: SITLA's recreation rules have changed more than once
+        camp_authority=(
+            "Trust land is not public recreation land by right; SITLA allows casual "
+            "camping on some parcels and requires a recreation permit on others, so check "
+            "before staying the night"
+        ),
     ),
     Owner(
         code="FFSL", name="Utah Forestry, Fire and State Lands", short="FFSL",
         tenure="state", public=True, collect=PERMIT, forage=ASK, color="#1565c0",
         authority="FFSL issues permits on sovereign and other state lands it administers",
+        camp=ASK,
+        camp_authority=(
+            "Sovereign and state lands are open to some recreation; ask FFSL whether "
+            "overnight camping is allowed on the parcel"
+        ),
     ),
     Owner(
         code="SL&F", name="Utah Forestry, Fire and State Lands", short="FFSL",
         tenure="state", public=True, collect=PERMIT, forage=ASK, color="#1565c0",
         authority="FFSL issues permits on sovereign and other state lands it administers",
+        camp=ASK,
+        camp_authority=(
+            "Sovereign and state lands are open to some recreation; ask FFSL whether "
+            "overnight camping is allowed on the parcel"
+        ),
     ),
     Owner(
         code="UDWR", name="Utah Division of Wildlife Resources", short="UDWR",
@@ -192,26 +273,49 @@ _UTAH_STATE = (
             "Wildlife management areas are managed for habitat; ask the regional office, "
             "and note that many WMAs are seasonally closed"
         ),
+        camp=ASK,
+        camp_authority=(
+            "Many wildlife management areas prohibit camping or close seasonally for "
+            "wintering wildlife; read the posted rules or ask the regional office"
+        ),
     ),
     Owner(
         code="USP", name="Utah State Parks", short="State Parks",
         tenure="state", public=True, collect=PROHIBITED, forage=PROHIBITED, color="#1565c0",
         authority="Collecting plants in a Utah state park is prohibited",
+        camp=PERMIT,
+        camp_authority=(
+            "Camping in a Utah state park is in its designated campground, for a fee - "
+            "there is no dispersed camping"
+        ),
     ),
     Owner(
         code="DNR", name="Utah Department of Natural Resources", short="DNR",
         tenure="state", public=True, collect=ASK, forage=ASK, color="#1565c0",
         authority="Ask the administering DNR division",
+        camp=ASK,
+        camp_authority=(
+            "Ask the administering DNR division before camping"
+        ),
     ),
     Owner(
         code="OS", name="other state", short="other state",
         tenure="state", public=True, collect=ASK, forage=ASK, color="#1565c0",
         authority="State ground held by an agency this registry does not name",
+        camp=ASK,
+        camp_authority=(
+            "State ground held by an agency this registry does not name - ask before "
+            "camping"
+        ),
     ),
     Owner(
         code="UDOT", name="Utah Department of Transportation", short="UDOT",
         tenure="state", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#37474f",
         authority="Highway right-of-way - not a place to park and dig",
+        camp=PROHIBITED,
+        camp_authority=(
+            "Highway right-of-way - not a place to camp"
+        ),
     ),
 )
 
@@ -228,11 +332,20 @@ _COMMON = (
             "Sovereign tribal land. Mushroom gathering is the tribe's to grant and is "
             "often reserved to members; this screening confers nothing"
         ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "Sovereign tribal land. Camping is the tribe's to allow, often by tribal "
+            "permit; this screening confers nothing"
+        ),
     ),
     Owner(
         code="Private", name="private land", short="private",
         tenure="private", public=False, collect=PROHIBITED, forage=PROHIBITED, color="#9e9e9e",
         authority="Private property - the landowner's permission is the only authority",
+        camp=PROHIBITED,
+        camp_authority=(
+            "Private property - camping needs the landowner's permission"
+        ),
     ),
 )
 
@@ -262,6 +375,12 @@ _IDAHO_STATE = (
             "Idaho endowment land is open to recreation, but gathering anything of "
             "value is a separate conversation with the IDL area office"
         ),
+        camp=ASK,  # unverified: IDL restricts some parcels and sets the stay limit
+        camp_authority=(
+            "Idaho endowment land is generally open to recreation, including short-stay "
+            "camping, but IDL restricts some parcels and sets the stay limit - check with "
+            "the area office"
+        ),
     ),
     Owner(
         code="STATEFG", name="Idaho Department of Fish and Game", short="IDFG",
@@ -269,6 +388,11 @@ _IDAHO_STATE = (
         authority=(
             "Wildlife management areas are managed for habitat; ask the regional "
             "office, and note that many WMAs are seasonally closed"
+        ),
+        camp=ASK,
+        camp_authority=(
+            "Many wildlife management areas prohibit camping or close seasonally for "
+            "wintering wildlife; read the posted rules or ask the regional office"
         ),
     ),
     Owner(
@@ -284,6 +408,10 @@ _IDAHO_STATE = (
             "mushrooms at the manager's discretion - ring the park before assuming "
             "either answer"
         ),
+        camp=PERMIT,
+        camp_authority=(
+            "Camping in an Idaho state park is in its designated campground, for a fee"
+        ),
     ),
 )
 
@@ -298,6 +426,11 @@ _IDAHO_ONLY = (
             "Corps project land around reservoirs is generally open to recreation, but "
             "there is no standing plant-permit programme; ask the project office"
         ),
+        camp=ASK,
+        camp_authority=(
+            "Corps project land is generally camping-in-designated-campgrounds-only; ask "
+            "the project office about anything else"
+        ),
     ),
     Owner(
         code="BIA", name="tribal land", short="tribal",
@@ -306,6 +439,11 @@ _IDAHO_ONLY = (
         authority=(
             "Land held in trust for a tribe. It is not public land and this screening "
             "confers nothing; entry and collection are the tribe's to grant"
+        ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "Land held in trust for a tribe. Camping is the tribe's to allow; this "
+            "screening confers nothing"
         ),
     ),
     Owner(
@@ -316,6 +454,11 @@ _IDAHO_ONLY = (
             "Indian reservation. It is not public land and this screening confers "
             "nothing; entry and collection are the tribe's to grant"
         ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "Indian reservation. Camping is the tribe's to allow, often by tribal permit; "
+            "this screening confers nothing"
+        ),
     ),
     Owner(
         # unverified
@@ -323,6 +466,11 @@ _IDAHO_ONLY = (
         tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED,
         color="#37474f",
         authority=(
+            "A land-utilization tract whose administering agency this registry has not "
+            "identified - treat it as closed until somebody does"
+        ),
+        camp=PROHIBITED,
+        camp_authority=(
             "A land-utilization tract whose administering agency this registry has not "
             "identified - treat it as closed until somebody does"
         ),
@@ -336,6 +484,11 @@ _IDAHO_ONLY = (
             "A land-utilization tract whose administering agency this registry has not "
             "identified - treat it as closed until somebody does"
         ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "A land-utilization tract whose administering agency this registry has not "
+            "identified - treat it as closed until somebody does"
+        ),
     ),
     Owner(
         # unverified
@@ -345,6 +498,10 @@ _IDAHO_ONLY = (
         authority=(
             "Bed of a historic or navigable watercourse. Even where the state holds it, "
             "it is riverbed - not ground to send somebody to dig on"
+        ),
+        camp=PROHIBITED,
+        camp_authority=(
+            "Bed of a historic or navigable watercourse - not ground to camp on"
         ),
     ),
     Owner(
@@ -356,6 +513,11 @@ _IDAHO_ONLY = (
         tenure="federal", public=False, collect=PROHIBITED, forage=PROHIBITED,
         color="#9e9e9e",
         authority=(
+            "The layer files this under a catch-all that spans several agencies, one of "
+            "them tribal - identify the administrator before assuming anything"
+        ),
+        camp=PROHIBITED,
+        camp_authority=(
             "The layer files this under a catch-all that spans several agencies, one of "
             "them tribal - identify the administrator before assuming anything"
         ),
@@ -394,6 +556,11 @@ UNKNOWN = Owner(
     color="#9e9e9e",
     authority="The surface management layer does not name an administrator for this "
               "polygon - treat it as closed until somebody identifies it",
+    camp=PROHIBITED,
+    camp_authority=(
+        "The surface management layer does not name an administrator for this polygon - "
+        "treat it as closed until somebody identifies it"
+    ),
 )
 
 
@@ -438,7 +605,7 @@ def stricter(a, b):
     """
     if a.public != b.public:
         return a if not a.public else b
-    for field_name in ("collect", "forage"):
+    for field_name in ("collect", "forage", "camp"):
         ra, rb = (_TAKING_RANK.index(getattr(x, field_name)) for x in (a, b))
         if ra != rb:
             return a if ra > rb else b
@@ -451,14 +618,15 @@ def taking(mode):
     `observe` has no such field on purpose: looking at an orchid in a national park is
     not a permit question, so nothing is consulted and every public owner is in scope.
     """
-    return {"collect": "collect", "forage": "forage"}.get(mode)
+    return {"collect": "collect", "forage": "forage", "camp": "camp"}.get(mode)
 
 
 def screenable(mode, reg):
     """Codes a taxon in this mode may be screened on, in this region.
 
     `collect` needs ground where a plant can lawfully leave; `forage` asks the same of
-    mushrooms and gets a different and generally wider answer; `observe` only needs
+    mushrooms and gets a different and generally wider answer; `camp` needs ground you
+    may lawfully sleep on, by right or by permit; `observe` only needs
     ground somebody can stand on, which is why an orchid map covers national parks and a
     juniper transplant map does not.
     """
@@ -472,8 +640,11 @@ def screenable(mode, reg):
 
 
 def authority_for(o, mode):
-    """The prose for this owner under this mode. Falls back to the plant text, which is
-    the right answer for every agency that treats the two the same."""
+    """The prose for this owner under this mode. Forage falls back to the plant text,
+    which is the right answer for every agency that treats the two the same; camp never
+    does, because no plant-permit sentence answers a camping question."""
+    if mode == "camp":
+        return o.camp_authority
     if mode == "forage" and o.forage_authority:
         return o.forage_authority
     return o.authority
@@ -509,12 +680,13 @@ if __name__ == "__main__":
     _reg = region_mod.resolve(sys.argv[1] if len(sys.argv) > 1 else region_mod.DEFAULT)
     print(f"\n  {_reg.name} - {len(registry(_reg))} administrators, keyed by "
           f"{_reg.owner_field}\n")
-    print(f"  {'code':<8} {'tenure':<8} {'entry':<7} {'plants':<10} {'mushrooms':<10} name")
+    print(f"  {'code':<8} {'tenure':<8} {'entry':<7} {'plants':<10} {'mushrooms':<10} "
+          f"{'camping':<10} name")
     for _c, _o in registry(_reg).items():
         _p = "public" if _o.public else "closed"
         print(f"  {_c:<8} {_o.tenure:<8} {_p:<7} {_o.collect:<10} "
-              f"{_o.forage:<10} {_o.name}")
-    print("\n  plants = collect mode, mushrooms = forage mode. `free` means personal-use")
-    print("  quantities without a permit, and is a mushroom answer only.")
+              f"{_o.forage:<10} {_o.camp:<10} {_o.name}")
+    print("\n  plants = collect mode, mushrooms = forage mode, camping = camp mode. `free`")
+    print("  means personal-use quantities, or dispersed camping, without a permit.")
     print(f"\n  Another region: `just owners <key>`; known: "
           f"{', '.join(sorted(REGISTRIES))}.")

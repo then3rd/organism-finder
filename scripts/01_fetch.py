@@ -244,6 +244,169 @@ def fetch_conditions(sp, reg):
             )
 
 
+# --- campsites (mode="camp") ---------------------------------------------------
+# Three sources, because none of them is the answer alone. OpenStreetMap is the only one
+# that maps individual primitive sites - the pads people actually use - and it is
+# crowd-sourced. The agency layers are authoritative and nearly all developed
+# campgrounds: 16 USFS "dispersed camping" markers cover the whole of Utah, and those mark
+# an area rather than a site. So OSM leads and the agencies fill in, and every row says
+# which source it came from.
+
+OVERPASS = "https://overpass-api.de/api/interpreter"
+OSM_TAGS = ("name", "camp_site", "backcountry", "fee", "reservation", "toilets",
+            "drinking_water", "operator", "access", "tents", "capacity", "website")
+# OSM access values meaning "not open to you". Dropped at fetch: a campground behind a
+# gate is not a site on anybody's map but its owner's.
+OSM_CLOSED = {"private", "customers", "no", "members"}
+DEDUPE_M = 250      # an agency point this close to an OSM one is the same campground
+
+
+def osm_class(tags):
+    """primitive / developed / unclassified, from a camp_site's OSM tags.
+
+    Backcountry and `camp_site=basic` win first: a wilderness pad that needs a permit and
+    a fee is still a primitive site. Then anything with a fee, a reservation system or a
+    service grade is developed, and a site explicitly marked free is primitive.
+    """
+    t = {k: str(v).lower() for k, v in tags.items() if v is not None}
+    if t.get("backcountry") == "yes" or t.get("camp_site") == "basic":
+        return "primitive"
+    if (t.get("camp_site") in ("standard", "serviced", "deluxe")
+            or t.get("fee") == "yes" or t.get("reservation") in ("yes", "required")):
+        return "developed"
+    if t.get("fee") == "no":
+        return "primitive"
+    return "unclassified"
+
+
+def fetch_osm_campsites(reg, path):
+    try:
+        cached = gpd.read_file(path, layer="osm")
+        print(f"  cached {path.name}:osm n={len(cached)}")
+        return cached
+    except Exception:
+        pass
+    if not reg.osm_area:
+        raise SystemExit(f"{reg.name}: Region.osm_area is not set - cannot query OSM")
+    print(f"  querying OpenStreetMap ({reg.osm_area}) ...", flush=True)
+    query = (f'[out:json][timeout:180];area["ISO3166-2"="{reg.osm_area}"]->.a;'
+             'nwr["tourism"="camp_site"](area.a);out tags center;')
+    data = get(OVERPASS, params={"data": query}, timeout=240).json()
+    feats = []
+    for e in data["elements"]:
+        where = e.get("center") or {"lat": e.get("lat"), "lon": e.get("lon")}
+        if where.get("lat") is None:
+            continue
+        tags = e.get("tags", {})
+        props = {k: tags.get(k) for k in OSM_TAGS}
+        props["osm_id"] = f"{e['type']}/{e['id']}"
+        feats.append({"type": "Feature", "properties": props,
+                      "geometry": {"type": "Point",
+                                   "coordinates": [where["lon"], where["lat"]]}})
+    if not feats:
+        raise SystemExit(f"{reg.name}: OpenStreetMap returned no campsites - check "
+                         "Region.osm_area and the Overpass service")
+    gdf = gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326").to_crs(reg.crs)
+    save(gdf, path, "osm")
+    return gdf
+
+
+def merge_campsites(osm, usfs, blm, reg):
+    """One point layer, one row per site, with `source` and `site_class` on every row."""
+    import pandas as pd
+
+    closed = osm["access"].fillna("").str.lower().isin(OSM_CLOSED)
+    print(f"  dropping {int(closed.sum())} OSM sites marked private or closed")
+    osm = osm[~closed]
+    rows = [gpd.GeoDataFrame({
+        "name": osm["name"],
+        "source": "osm",
+        "site_class": [osm_class(r) for r in osm[list(OSM_TAGS)].to_dict("records")],
+        "fee": osm["fee"],
+        # pd.notna, not truthiness: a missing tag comes back from the GeoPackage as NaN,
+        # which is truthy and would print "camp_site=nan" into every waypoint.
+        "detail": osm.apply(lambda r: ", ".join(
+            f"{k}={r[k]}" for k in ("camp_site", "backcountry", "toilets",
+                                    "drinking_water", "operator")
+            if pd.notna(r[k]) and r[k] != ""), axis=1),
+        "url": osm["website"],
+        "source_id": osm["osm_id"],
+    }, geometry=osm.geometry, crs=reg.crs)]
+
+    agency = []
+    if len(usfs):
+        dispersed = usfs["markeractivity"].eq("Dispersed Camping")
+        agency.append(gpd.GeoDataFrame({
+            "name": usfs["recareaname"],
+            "source": "usfs",
+            "site_class": ["primitive" if d else "developed" for d in dispersed],
+            "fee": usfs["feedescription"].fillna("").str.slice(0, 120),
+            "detail": [f"{a} - marks an area, not a pad" if d else a
+                       for a, d in zip(usfs["markeractivity"], dispersed)],
+            "url": usfs["recareaurl"],
+            "source_id": usfs["recareaid"].astype(str),
+        }, geometry=usfs.geometry, crs=reg.crs))
+    if len(blm):
+        agency.append(gpd.GeoDataFrame({
+            "name": blm["FacilityName"],
+            "source": "blm",
+            # recreation.gov listings: somebody built and runs these
+            "site_class": "developed",
+            "fee": blm["FacilityUseFeeDescription"].fillna("").str.slice(0, 120),
+            "detail": blm["FacilityTypeDescription"],
+            "url": blm["BLMFacURL"],
+            "source_id": blm["FacilityID"].astype(str),
+        }, geometry=blm.geometry, crs=reg.crs))
+
+    sites = rows[0]
+    sites["also_in"] = None
+    for ag in agency:
+        ag = ag.drop_duplicates("source_id")
+        near = gpd.sjoin_nearest(ag[["geometry"]], sites[["geometry"]], how="left",
+                                 max_distance=DEDUPE_M)
+        near = near[~near.index.duplicated()]
+        dup = near["index_right"].notna()
+        src = ag["source"].iat[0] if len(ag) else ""
+        hit = near.loc[dup, "index_right"].astype(int).to_numpy()
+        sites.loc[sites.index[sites.index.isin(hit)], "also_in"] = src
+        print(f"  {src}: {len(ag)} sites, {int(dup.sum())} already in OSM within "
+              f"{DEDUPE_M} m")
+        ag = ag[~dup.to_numpy()].copy()
+        ag["also_in"] = None
+        sites = gpd.GeoDataFrame(pd.concat([sites, ag], ignore_index=True), crs=reg.crs)
+    sites.insert(0, "site_id", range(1, len(sites) + 1))
+    return sites
+
+
+def fetch_campsites(reg):
+    path = paths.campsites_gpkg(reg)
+    print("campsites (OpenStreetMap, USFS, BLM)")
+    bbox = region_bbox(reg)
+    osm = fetch_osm_campsites(reg, path)
+    usfs = fetch_layer(reg.usfs_rec, path, "usfs", reg.crs, where=reg.usfs_camp_where,
+                       bbox=bbox)
+    blm = fetch_layer(reg.blm_camp, path, "blm", reg.crs, bbox=bbox)
+    # Rebuilt every run from the three cached layers: merging is seconds, and a change to
+    # the classification rules above should not need a re-download to take effect.
+    sites = merge_campsites(osm, usfs, blm, reg)
+    # The agency layers were narrowed by the bbox, which takes in the neighbours' forests
+    # along every border. Outside the region there is no SMA polygon to say who
+    # administers the ground, so those sites would read as unknown owner - clip them.
+    counties = gpd.read_file(paths.raw_dir(reg) / "counties.gpkg",
+                             layer="counties").to_crs(reg.crs)
+    inside = sites.within(counties.union_all())
+    print(f"  dropping {int((~inside).sum())} sites outside {reg.name}")
+    sites = sites[inside].reset_index(drop=True)
+    sites["site_id"] = range(1, len(sites) + 1)
+    if not len(sites):
+        raise SystemExit(f"{reg.name}: no campsites from any source - nothing to mark")
+    save(sites, path, "sites")
+    print("  by class: " + ", ".join(
+        f"{k} {v}" for k, v in sites["site_class"].value_counts().items()))
+    print("  by source: " + ", ".join(
+        f"{k} {v}" for k, v in sites["source"].value_counts().items()))
+
+
 def fetch_range(sp, reg):
     """Dispatch on the taxon's range source; None means the region is the range."""
     if sp.range_source == species_mod.LITTLE:
@@ -265,8 +428,10 @@ def main():
     fetch_region(reg)
     fetch_range(sp, reg)
     fetch_conditions(sp, reg)
+    if sp.mode == species_mod.CAMP:
+        fetch_campsites(reg)
 
-    if sp.needs_landfire:
+    if sp.cover == species_mod.EVT:
         print("LANDFIRE EVT attribute table")
         csv = paths.evt_csv()
         if not csv.exists():

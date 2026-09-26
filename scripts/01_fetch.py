@@ -407,6 +407,112 @@ def fetch_campsites(reg):
         f"{k} {v}" for k, v in sites["source"].value_counts().items()))
 
 
+# --- roads (mode="camp") ----------------------------------------------------------
+# For the best-spots step: is there a track to a cell, and how far is it from pavement.
+# OpenStreetMap rather than the agencies' route layers because it is one schema for BLM
+# and Forest Service ground alike, and it maps the two-tracks the agencies' layers omit.
+ROAD_HIGHWAYS = ("track|unclassified|tertiary|tertiary_link|secondary|secondary_link|"
+                 "primary|primary_link|trunk|trunk_link|motorway|motorway_link")
+ROAD_TAGS = ("highway", "surface", "tracktype", "4wd_only", "access", "motor_vehicle",
+             "name")
+ROAD_GRID = 3           # the region bbox is queried as a GRID x GRID set of pieces
+PAVED_HIGHWAYS = {"motorway", "motorway_link", "trunk", "trunk_link", "primary",
+                  "primary_link", "secondary", "secondary_link"}
+PAVED_SURFACES = {"paved", "asphalt", "concrete", "concrete:plates", "paving_stones",
+                  "chipseal"}
+ROUGH_GRADES = {"grade3", "grade4", "grade5"}
+
+
+def road_class(tags):
+    """paved / graded / rough. A tertiary with no surface tag is taken as graded: in
+    rural Utah a good share of them are gravel, and calling one paved would count it
+    against a spot's quiet score for traffic it does not carry."""
+    hw, surface = tags.get("highway"), (tags.get("surface") or "").lower()
+    if hw in PAVED_HIGHWAYS or surface in PAVED_SURFACES:
+        return "paved"
+    if tags.get("4wd_only") == "yes" or tags.get("tracktype") in ROUGH_GRADES:
+        return "rough"
+    return "graded"
+
+
+def overpass_piece(query, cache, tries=6):
+    """One Overpass query, cached to disk, retried on 429.
+
+    The public Overpass server rate-limits by client, and nine large queries in a row
+    trip it. A 429 is the server saying "later", not "wrong", so this waits and tries
+    again - and each piece is cached, so a failure halfway costs only the pieces left.
+    """
+    import time
+
+    if cache.exists():
+        return json.loads(cache.read_text())
+    for attempt in range(tries):
+        try:
+            data = get(OVERPASS, params={"data": query}, timeout=360).json()
+            cache.write_text(json.dumps(data))
+            return data
+        except RuntimeError as exc:
+            if "HTTP 429" not in str(exc) and "HTTP 504" not in str(exc):
+                raise
+            wait = 60 * (attempt + 1)
+            print(f"    overpass busy ({exc}); waiting {wait}s", flush=True)
+            time.sleep(wait)
+    raise SystemExit("Overpass kept refusing - try `just fetch` again later; finished "
+                     "pieces are cached")
+
+
+def fetch_roads(reg):
+    path = paths.roads_gpkg(reg)
+    try:
+        roads = gpd.read_file(path, layer="roads")
+        print(f"  cached {path.name}:roads n={len(roads)}")
+        return
+    except Exception:
+        pass
+    print(f"OpenStreetMap roads and tracks ({reg.osm_area})")
+    minx, miny, maxx, maxy = region_bbox(reg)
+    dx, dy = (maxx - minx) / ROAD_GRID, (maxy - miny) / ROAD_GRID
+    pieces = paths.raw_dir(reg) / "roads_pieces"
+    pieces.mkdir(exist_ok=True)
+    feats, seen = [], set()
+    for i in range(ROAD_GRID):
+        for j in range(ROAD_GRID):
+            s, w = miny + j * dy, minx + i * dx
+            query = (f'[out:json][timeout:300];area["ISO3166-2"="{reg.osm_area}"]->.a;'
+                     f'way["highway"~"^({ROAD_HIGHWAYS})$"]'
+                     f'({s},{w},{s + dy},{w + dx})(area.a);out tags geom;')
+            data = overpass_piece(query, pieces / f"piece_{i}_{j}.json")
+            n = 0
+            for e in data["elements"]:
+                if e["id"] in seen or len(e.get("geometry", [])) < 2:
+                    continue
+                seen.add(e["id"])
+                tags = e.get("tags", {})
+                if (tags.get("access") in ("no", "private")
+                        or tags.get("motor_vehicle") in ("no", "private")):
+                    continue
+                props = {k: tags.get(k) for k in ROAD_TAGS}
+                props["road_class"] = road_class(tags)
+                feats.append({"type": "Feature", "properties": props, "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[p["lon"], p["lat"]] for p in e["geometry"]]}})
+                n += 1
+            print(f"    piece {i * ROAD_GRID + j + 1}/{ROAD_GRID ** 2}: {n:,} ways",
+                  flush=True)
+    if not feats:
+        raise SystemExit(f"{reg.name}: OpenStreetMap returned no roads")
+    roads = gpd.GeoDataFrame.from_features(feats, crs="EPSG:4326").to_crs(reg.crs)
+    save(roads, path, "roads")
+    print("  by class: " + ", ".join(
+        f"{k} {v}" for k, v in roads["road_class"].value_counts().items()))
+
+
+def fetch_forests(reg):
+    print("national forest boundaries")
+    fetch_layer(reg.usfs_forests, paths.forests_gpkg(reg), "forests", reg.crs,
+                bbox=region_bbox(reg))
+
+
 def fetch_range(sp, reg):
     """Dispatch on the taxon's range source; None means the region is the range."""
     if sp.range_source == species_mod.LITTLE:
@@ -430,6 +536,8 @@ def main():
     fetch_conditions(sp, reg)
     if sp.mode == species_mod.CAMP:
         fetch_campsites(reg)
+        fetch_roads(reg)
+        fetch_forests(reg)
 
     if sp.cover == species_mod.EVT:
         print("LANDFIRE EVT attribute table")

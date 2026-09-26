@@ -138,6 +138,12 @@ class Region:
         "https://gis.blm.gov/arcgis/rest/services/recreation/"
         "BLM_Natl_Recreation_Sites_Facilities/MapServer/8"
     )
+    # National forest boundaries. The SMA layer says only "USFS", so without this every
+    # Forest Service cell has the same managing unit and "ten per forest" is ten in all.
+    usfs_forests: str = (
+        "https://apps.fs.usda.gov/arcx/rest/services/EDW/"
+        "EDW_ForestSystemBoundaries_01/MapServer/0"
+    )
     # USGS 3DEP, for slope cover. Queried in the LANDFIRE grid so the slope class tiles
     # line up with the EVT ones pixel for pixel.
     dem_imageserver: str = (

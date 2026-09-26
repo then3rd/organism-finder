@@ -51,6 +51,7 @@ just evt-classes pinyon   # which LANDFIRE classes a keyword selects
 just fetch      [slug] [reg]  # 01 sources -> data/raw/**       (cached; re-runs are free)
 just landfire   [slug] [reg]  # 02 EVT tiles -> data/work/<reg>/<slug>/class.vrt  (EVT taxa only)
 just overlay    [slug] [grid] [reg]  # 03 cross-ref -> out/<reg>/<slug>/<slug>.gpkg + funnel.csv
+just best       [slug] [reg]  # 03b camp mode only: best ~10 spots per unit -> best_cells / best_spots
 just export     [slug] [reg]  # 04 deliverables -> out/<reg>/<slug>/*.csv, summary.md, kml/gpx
 just qgis       [slug] [reg]  # 05 map -> out/<reg>/<slug>/<slug>.qgs + <slug>_qfield.qgz
 just qfield     [slug] [reg]  # what to copy to the phone (runs 05 first)
@@ -123,7 +124,8 @@ Three spatial units come out of stage 03 and everything downstream keys off them
 
 All screening layers live in the single `out/<slug>/<slug>.gpkg` (`candidates`, `hotspots`,
 `other_cells`, `public_land`, `land_all`, `species_range`, `occurrences`, `burns`,
-`water_buffer`, `exclusions`, `field_offices`, `office_points`, and `campsites` in camp mode);
+`water_buffer`, `exclusions`, `field_offices`, `office_points`, and `campsites`,
+`best_cells` and `best_spots` in camp mode);
 stages 04 and 05 both read only from it. Two side-cars sit beside it,
 and both are side-cars because stage 03 rewrites that file wholesale: `about.gpkg` holds
 the one-feature fact sheet stage 05 regenerates every run, and `field_notes.gpkg` holds
@@ -321,6 +323,34 @@ campground on a private inholding shows faded rather than vanishing; cells and p
 informational `campsites` count. Stage 04 writes `campsites.gpx/.kml` (open ground only,
 `P`/`D` name prefixes) and a summary section; stage 05 draws them achromatic by shape -
 filled star primitive, hollow diamond developed - per the cartography rule below.
+
+### Best spots (camp mode)
+
+`scripts/03b_best.py` (`just best`, run by `just all` between overlay and export) cuts the
+camping cells to a shortlist - about ten per BLM field office and national forest - and
+writes `best_cells` and `best_spots` into `<slug>.gpkg`, plus `best_funnel.csv`. It is a
+separate step because stage 03 takes twenty minutes and this takes seconds, so the rules at
+the top of the file can be tuned by rerunning it alone; stage 03 rewrites the GeoPackage
+wholesale, which is why it must always run after 03. For any non-camp taxon it is a no-op.
+
+Gates, in order (each a funnel row): free dispersed owner (`Owner.camp == FREE`, i.e. BLM and
+USFS), `MIN_FLAT_PCT`, a drivable unpaved road within `MAX_ACCESS_M`, pavement no nearer than
+`MIN_PAVED_M`, under `MAX_PLAYA_PCT` playa and `MAX_DEV_PCT` developed. Score is the
+equal-weight mean of water, shade (`tree_pct`, full at `SHADE_FULL_PCT`), variety (exp of
+the Shannon entropy over the cell's tree/shrub/herb EVT classes - a habitat-heterogeneity
+proxy, not a species count) and quiet (distance from pavement, full at `QUIET_FULL_M`), plus
+`ROUGH_BONUS` for a 4x4 track in. Picks are spaced `MIN_SEP_M` apart with
+`common.spaced()`, which stage 04's `best_sites()` also uses.
+
+Its data: the *raw* EVT tiles stage 02 caches per region (read through `paths.evt_vrt()`, so
+any EVT taxon's stage 02 must have run in the region first); OpenStreetMap roads from stage
+01 (`fetch_roads`, classed paved / graded / rough, fetched as a 3x3 grid of Overpass queries
+each cached under `roads_pieces/`, retried on HTTP 429); and national forest boundaries
+(`fetch_forests`), because the SMA layer says only "USFS" and would make "ten per forest"
+ten in all - a USFS cell takes its *nearest* forest, so outlying tracts do not form units of
+one. Playa masking is what finally keeps the salt flats off the shortlist. Stage 05 draws the
+cells ringed white over a dark casing and the points as black hexagons, the one marker shape
+nothing else uses.
 
 ### Occurrence screening
 

@@ -56,6 +56,16 @@ def campsites_gpkg(region):
     return raw_dir(region) / "campsites.gpkg"
 
 
+def roads_gpkg(region):
+    """OpenStreetMap roads and tracks, classed paved / graded / rough. Camp mode only."""
+    return raw_dir(region) / "roads.gpkg"
+
+
+def forests_gpkg(region):
+    """National forest boundaries, for naming the unit a Forest Service cell is in."""
+    return raw_dir(region) / "usfs_forests.gpkg"
+
+
 def evt_csv():
     """The LANDFIRE EVT attribute table. One file for the whole country."""
     return _mk(RAW / "evt") / "LF23_EVT_240.csv"
@@ -70,6 +80,12 @@ def evt_tile_dir(region):
     of stage 02, not an optimisation.
     """
     return _mk(WORK / "evt" / region.key)
+
+
+def evt_vrt(region):
+    """A VRT over the raw EVT tiles, for reading real class values rather than a
+    taxon's remap. Taxon-free, so it sits with the tiles it points at."""
+    return evt_tile_dir(region) / "evt.vrt"
 
 
 def slope_tile_dir(region):

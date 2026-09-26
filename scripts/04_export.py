@@ -34,6 +34,7 @@ import habitat  # noqa: E402
 import paths  # noqa: E402
 import region as region_mod  # noqa: E402
 import species as species_mod  # noqa: E402
+from common import spaced  # noqa: E402
 
 N_WAYPOINTS = 50
 HOTSPOT_MIN_PCT = 25.0      # mirrors 03_overlay.py, for the no-cells wording only
@@ -91,7 +92,7 @@ def ranked(sp):
     return bool(habitat.scores(sp.conditions))
 
 
-def tables(cand, hot, funnel, sp, reg, out, sites=None):
+def tables(cand, hot, funnel, sp, reg, out, sites=None, best=None):
     year = datetime.date.today().year
     # Named rather than assumed: stage 03 chose the lattice and this stage only reports it.
     shape = grid_mod.recall(paths.grid_marker(sp, reg))
@@ -218,6 +219,8 @@ def tables(cand, hot, funnel, sp, reg, out, sites=None):
                 + f"{r['evidence']} | {r['lat']:.5f} | {r['lon']:.5f} |"
             )
 
+    if best is not None:
+        lines += best_section(best, out)
     if sites is not None:
         lines += campsite_section(sites, hot, reg)
     lines += factsheet.caveats(sp, reg)
@@ -286,17 +289,7 @@ def best_sites(sites, hot, n=N_TABLE, sep=MIN_SEPARATION_M):
                   how="left", predicate="within")
     j = j[~j.index.duplicated()].drop(columns="index_right")
     j = j.sort_values(["cell_rank", "site_id"], na_position="last")
-    xy = np.column_stack([j.geometry.x.to_numpy(), j.geometry.y.to_numpy()])
-    used = np.zeros(len(j), dtype=bool)
-    chosen = []
-    for i in range(len(j)):
-        if used[i]:
-            continue
-        chosen.append(i)
-        used |= np.hypot(xy[:, 0] - xy[i, 0], xy[:, 1] - xy[i, 1]) < sep
-        if len(chosen) >= n:
-            break
-    return j.iloc[chosen]
+    return j.iloc[spaced(j.geometry.x, j.geometry.y, sep, n)]
 
 
 def campsite_section(sites, hot, reg):
@@ -380,6 +373,88 @@ def campsite_waypoints(sites, out):
           + ", ".join(f"{counts.get(c, 0)} {c}" for c in CLASS_ORDER) + ")")
 
 
+# --- best spots (scripts/03b_best.py) ----------------------------------------------
+def best_section(best, out):
+    """summary.md: how the shortlist was cut, and the shortlist, one table per unit."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "best", Path(__file__).resolve().parent / "03b_best.py")
+    b = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(b)
+    funnel = pd.read_csv(out / "best_funnel.csv")
+    units = best["unit"].nunique()
+    lines = [
+        "",
+        f"## Best spots ({len(best)}, in {units} units)",
+        "",
+        "The cells above narrowed to a shortlist: free dispersed ground only, a drivable",
+        "track close by, away from pavement, and no salt flat or development - then scored",
+        "equally on nearness to water, shade, habitat variety and quiet, with a small bonus",
+        f"where the way in is a rough 4x4 track. The best {b.PER_UNIT} in each BLM field",
+        f"office and national forest, at least {b.MIN_SEP_M / 1000:g} km apart. The same",
+        "spots are in `best_spots.gpx` / `.kml` and on the map as black hexagons.",
+        "",
+        "| step | cells |",
+        "|---|---:|",
+        *[f"| {r['stage']} | {int(r['cells']):,} |" for _, r in funnel.iterrows()],
+        "",
+        f"Score is 0-1, plus {b.ROUGH_BONUS:g} where the way in is a rough 4x4 track. "
+        "Trees % is shade; variety is the effective number of habitat types "
+        "in the cell (1 = one vegetation type); access is the nearest drivable unpaved road.",
+    ]
+    for unit, g in best.groupby("unit", sort=False):
+        lines += [
+            "",
+            f"### {unit}",
+            "",
+            "| # | score | flat % | water % | trees % | variety | km to pavement | "
+            "access | nearest known site | lat | lon |",
+            "|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|",
+        ]
+        for _, r in g.iterrows():
+            road = r["access_class"] or ""
+            if isinstance(r["access_name"], str) and r["access_name"]:
+                road += f" ({r['access_name']})"
+            road += f", {r['dist_access_m']:.0f} m"
+            site = ("" if pd.isna(r["nearest_site_m"])
+                    else f"{r['nearest_site_m'] / 1000:.1f} km")
+            lines.append(
+                f"| {int(r['best_rank'])} | {r['score']:.2f} | {r['species_pct']:.0f} | "
+                f"{r['water_pct']:.0f} | {r['tree_pct']:.0f} | {r['variety']:.1f} | "
+                f"{r['dist_paved_m'] / 1000:.1f} | {road} | {site} | "
+                f"{r['lat']:.5f} | {r['lon']:.5f} |")
+    return lines
+
+
+def best_waypoints(best, out):
+    """best_spots.gpx / .kml - the shortlist, one KML folder per unit."""
+    kml = simplekml.Kml(name="Best camping spots")
+    gpx = gpxpy.gpx.GPX()
+    for unit, g in best.groupby("unit", sort=False):
+        folder = kml.newfolder(name=unit)
+        for _, r in g.iterrows():
+            label = f"{unit} #{int(r['best_rank'])}"
+            road = r["access_class"] or "road"
+            if isinstance(r["access_name"], str) and r["access_name"]:
+                road += f" ({r['access_name']})"
+            desc = "\n".join((
+                f"score {r['score']:.2f}: water {r['s_water']:.2f}, shade {r['s_shade']:.2f}, "
+                f"variety {r['s_variety']:.2f}, quiet {r['s_quiet']:.2f}",
+                f"{r['species_pct']:.0f} % flat, {r['tree_pct']:.0f} % trees, "
+                f"{r['dist_paved_m'] / 1000:.1f} km from pavement",
+                f"leave the {road} at {r['access_lat']:.5f}, {r['access_lon']:.5f} "
+                f"({r['dist_access_m']:.0f} m from here)",
+                f"{r['owner_name']} - {r['county']}",
+            ))
+            folder.newpoint(name=label, description=desc, coords=[(r["lon"], r["lat"])])
+            gpx.waypoints.append(gpxpy.gpx.GPXWaypoint(
+                r["lat"], r["lon"], name=label, description=desc, symbol="Campground"))
+    kml.save(str(out / "best_spots.kml"))
+    (out / "best_spots.gpx").write_text(gpx.to_xml())
+    print(f"  -> best_spots.kml, best_spots.gpx ({len(best)} spots)")
+
+
 def nothing_qualified(sp, reg, out):
     """Stage 03 found no eligible ground. Write the one thing there is to say.
 
@@ -390,7 +465,8 @@ def nothing_qualified(sp, reg, out):
     # keywords changed. Leaving its deliverables next to a summary saying nothing qualified
     # is the most misleading state this stage can produce, so clear them.
     for stale in ("candidates.csv", "hotspots.csv", "scouting.kml", "scouting.gpx",
-                  "campsites.kml", "campsites.gpx"):
+                  "campsites.kml", "campsites.gpx", "best_spots.kml",
+                  "best_spots.gpx", "best_funnel.csv"):
         (out / stale).unlink(missing_ok=True)
 
     funnel = pd.read_csv(out / "funnel.csv")
@@ -432,13 +508,19 @@ def main():
     funnel = pd.read_csv(out / "funnel.csv")
     print(f"{sp.common_name}: candidates={len(cand)}  hotspots={len(hot)}  "
           f"owners={cand['owner'].nunique()}")
-    sites = None
+    sites = best = None
     if sp.mode == species_mod.CAMP:
         sites = gpd.read_file(gpkg, layer="campsites")
-    tables(cand, hot, funnel, sp, reg, out, sites)
+        try:
+            best = gpd.read_file(gpkg, layer="best_spots")
+        except Exception:
+            print("  no best_spots layer - run `just best` for the shortlist")
+    tables(cand, hot, funnel, sp, reg, out, sites, best)
     waypoints(hot, sp, out)
     if sites is not None:
         campsite_waypoints(sites, out)
+    if best is not None:
+        best_waypoints(best, out)
 
 
 if __name__ == "__main__":

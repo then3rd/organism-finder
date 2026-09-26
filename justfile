@@ -59,6 +59,11 @@ landfire sp="junioste" reg="ut":
 overlay sp="junioste" grid="hex" reg="ut":
     {{py}} scripts/03_overlay.py {{sp}} {{grid}} {{reg}}
 
+# Camp mode only: the best ~10 spots per BLM field office / national forest, from the
+# overlay's cells -> best_cells / best_spots in the GeoPackage. A no-op for any plant.
+best sp="junioste" reg="ut":
+    {{py}} scripts/03b_best.py {{sp}} {{reg}}
+
 # csv / md / kml / gpx -> out/<reg>/<sp>/.
 export sp="junioste" reg="ut":
     {{py}} scripts/04_export.py {{sp}} {{reg}}
@@ -78,7 +83,7 @@ qfield sp="junioste" reg="ut": (qgis sp reg)
     echo "notes come back in $dir/field_notes.gpkg - clean will not touch it"
 
 # Full pipeline, in order.
-all sp="junioste" grid="hex" reg="ut": (fetch sp reg) (landfire sp reg) (overlay sp grid reg) (export sp reg) (qgis sp reg)
+all sp="junioste" grid="hex" reg="ut": (fetch sp reg) (landfire sp reg) (overlay sp grid reg) (best sp reg) (export sp reg) (qgis sp reg)
 
 # Every registered species, in registry order. Hours, not minutes.
 all-species reg="ut":

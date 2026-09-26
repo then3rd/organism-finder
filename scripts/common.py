@@ -107,3 +107,25 @@ def esri_count(layer_url, where="1=1", bbox=None):
 
 def dump_json(obj, path):
     Path(path).write_text(json.dumps(obj))
+
+
+def spaced(x, y, sep, n):
+    """Indices of up to `n` points, in the order given, none within `sep` of another.
+
+    Greedy: take the next point in order unless something already taken is closer than
+    `sep`. The caller's order is the ranking, so this keeps the best and drops its
+    neighbours - without it a shortlist is ten cells along one creek.
+    """
+    import numpy as np
+
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    used = np.zeros(len(x), dtype=bool)
+    chosen = []
+    for i in range(len(x)):
+        if used[i]:
+            continue
+        chosen.append(i)
+        used |= np.hypot(x - x[i], y - y[i]) < sep
+        if len(chosen) >= n:
+            break
+    return chosen

@@ -844,6 +844,33 @@ def main():
              "outline_width": "0.3", "size": "2"}
         )))
 
+    # The shortlist (scripts/03b_best.py), over the ~100k cells it was cut from. The cells
+    # are ringed rather than filled - white over a dark casing, no new hue - so the owner
+    # colour underneath still says whose rules apply; the point is a black hexagon, the
+    # one marker shape nothing else here uses.
+    best_cells = gpkg_layer(gpkg, "best_cells")
+    if best_cells.isValid() and best_cells.featureCount():
+        add(project, best_cells, "Best spots: cells",
+            "The shortlisted cells: free dispersed ground (BLM, USFS), at least half flat, "
+            "a drivable track within 400 m, pavement at least 1.5 km off, no salt flat or "
+            "development; scored equally on water, shade, habitat variety and quiet.")
+        best_cells.setRenderer(QgsSingleSymbolRenderer(
+            washed("#ffffff", 0, CASING, width=0.6, under_width=1.4)))
+    best_spots = gpkg_layer(gpkg, "best_spots")
+    if best_spots.isValid() and best_spots.featureCount():
+        add(project, best_spots, f"Best spots ({best_spots.featureCount()})",
+            "About ten per BLM field office and national forest, at least 3 km apart. "
+            "Tap one for its score, what it scored on, and where to leave the track.")
+        best_spots.setRenderer(marker("hexagon", color="#000000", outline=MARK,
+                                      size="4.5", width="0.6"))
+        label_with(best_spots, "\"unit\" || ' #' || \"best_rank\"", expression=True,
+                   size=8)
+        labeling = best_spots.labeling().settings()
+        labeling.scaleVisibility = True
+        labeling.maximumScale = 0
+        labeling.minimumScale = 250000
+        best_spots.setLabeling(QgsVectorLayerSimpleLabeling(labeling))
+
     # Above the cells and parcels, below the offices and the reader's own layers: the
     # sites are the reason to zoom in, and a cell drawn over them would hide the answer.
     sites = gpkg_layer(gpkg, "campsites")
